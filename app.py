@@ -478,7 +478,7 @@ with tab1:
                 with st.chat_message("assistant"):
                     with st.spinner("Analyzing snaps, target shares & matchup data..."):
                         response = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model="gemini-3.8-flash",
                             contents=user_query,
                             config=types.GenerateContentConfig(
                                 system_instruction=system_instruction,
