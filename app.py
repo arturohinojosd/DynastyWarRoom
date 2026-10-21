@@ -54,9 +54,71 @@ WAIVER_DAY_MAP = {
 }
 
 # Prioritized High-to-Low AI Model Cascade
-AI_MODEL_CASCADE = [
-    "gemini-3.1-pro-preview",
-    "gemini-3.8-flash",
+def generate_ai_response_with_fallback(
+    client, preferred_model, prompt_text, sys_instruction
+):
+  """Dynamically discovers all models available to your API key, prioritizes
+
+  highest versions first, and retries with exponential backoff on 503 high-demand
+  spikes.
+  """
+  # 1. Build candidate list starting with preferred + cascade
+  candidate_models = []
+  for m in [preferred_model] + AI_MODEL_CASCADE:
+    if m and m not in candidate_models:
+      candidate_models.append(m)
+
+  # 2. Dynamically append any other active generateContent models from your API key
+  try:
+    for m_obj in client.models.list():
+      m_id = getattr(m_obj, "name", "").replace("models/", "")
+      if "gemini" in m_id and "embedding" not in m_id and "imagen" not in m_id:
+        if m_id not in candidate_models:
+          candidate_models.append(m_id)
+  except Exception:
+    pass
+
+  last_err = None
+  # 3. Two full passes with backoff so temporary 503 spikes resolve automatically
+  for attempt in range(2):
+    for m_name in candidate_models:
+      try:
+        response = client.models.generate_content(
+            model=m_name,
+            contents=prompt_text,
+            config=types.GenerateContentConfig(
+                system_instruction=sys_instruction,
+                temperature=0.25,
+            ),
+        )
+        if response and response.text:
+          return response.text, m_name
+      except Exception as e:
+        last_err = e
+        err_str = str(e).upper()
+        if "API_KEY_INVALID" in err_str or "INVALID API KEY" in err_str:
+          raise e
+        # If 503 high demand, pause briefly and retry the same working model once before moving on
+        if "503" in err_str or "UNAVAILABLE" in err_str:
+          time.sleep(1.5)
+          try:
+            retry_resp = client.models.generate_content(
+                model=m_name,
+                contents=prompt_text,
+                config=types.GenerateContentConfig(
+                    system_instruction=sys_instruction,
+                    temperature=0.25,
+                ),
+            )
+            if retry_resp and retry_resp.text:
+              return retry_resp.text, m_name
+          except Exception:
+            pass
+        continue
+    time.sleep(1.0)
+
+  raise last_err
+
 ]
 
 
