@@ -1,5 +1,6 @@
 import datetime
 import re
+import time
 from collections import defaultdict
 import numpy as np
 import pandas as pd
@@ -56,20 +57,24 @@ WAIVER_DAY_MAP = {
 # ==============================================================================
 # HELPER UTILITIES
 # ==============================================================================
-def get_json(url):
-  try:
-    headers = {
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "Expires": "0",
-    }
-    r = requests.get(url, headers=headers, timeout=12)
-    if r.status_code == 200:
-      return r.json()
-  except Exception:
-    pass
-  return None
-
+def get_json(url, bust_cache=False):
+    """Fetches JSON from URL; optionally appends a timestamp query param to bypass CDN cache."""
+    try:
+        target_url = url
+        if bust_cache:
+            sep = "&" if "?" in url else "?"
+            target_url = f"{url}{sep}_cb={int(time.time() * 1000)}"
+        headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+        r = requests.get(target_url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
 
 
 def clean_name(name_str):
@@ -149,6 +154,7 @@ def calc_expected_fp(st_d, scoring, pos):
         xfp = 0.0
     return round(xfp, 2)
 
+
 def generate_ai_response_with_fallback(client, primary_model, prompt_text, sys_instruction):
     """Calls Gemini API with automatic fallback across models if 503 UNAVAILABLE or 404 occurs."""
     candidate_models = []
@@ -179,15 +185,13 @@ def generate_ai_response_with_fallback(client, primary_model, prompt_text, sys_i
 
 
 # ==============================================================================
-# CACHED MASTER DATA PIPELINE
+# LAYER 1: HEAVY REFERENCE DATA PIPELINE (CACHED 30 MINS FOR SPEED)
 # ==============================================================================
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
-    # 1. Detect Current NFL State & Active Season
-    nfl_state = get_json("https://api.sleeper.app/v1/state/nfl") or {}
-    curr_season = int(nfl_state.get("season", 2026))
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_reference_data(curr_season, target_week, lookback_weeks, is_superflex, scoring_Items_tuple):
+    scoring_settings = dict(scoring_Items_tuple)
 
-    # 2. Master NFL Database & Trending Adds
+    # 1. Master NFL Player Database & Trending Adds
     players_db = get_json("https://api.sleeper.app/v1/players/nfl") or {}
     trending_adds_raw = (
         get_json("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=100")
@@ -195,77 +199,7 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
     )
     trending_map = {str(item["player_id"]): int(item["count"]) for item in trending_adds_raw}
 
-    # 3. League Settings, Scoring, Users, Rosters, Matchups & Traded Picks
-    league_info = get_json(f"https://api.sleeper.app/v1/league/{league_id}") or {}
-    roster_positions = league_info.get("roster_positions") or []
-    scoring_settings = league_info.get("scoring_settings") or {}
-    league_settings = league_info.get("settings") or {}
-
-    is_superflex = ("SUPER_FLEX" in roster_positions) or (roster_positions.count("QB") >= 2)
-
-    users = get_json(f"https://api.sleeper.app/v1/league/{league_id}/users") or []
-    rosters = get_json(f"https://api.sleeper.app/v1/league/{league_id}/rosters") or []
-    matchups = get_json(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{target_week}") or []
-    prev_matchups = (
-        get_json(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{max(1, target_week - 1)}")
-        or []
-    )
-    traded_picks = get_json(f"https://api.sleeper.app/v1/league/{league_id}/traded_picks") or []
-
-    u_map = {
-        u["user_id"]: normalize_gm(u.get("display_name", "User"))
-        for u in users
-        if u.get("user_id")
-    }
-
-    rid_to_gm_local = {}
-    for r in rosters:
-        rid_to_gm_local[int(r.get("roster_id"))] = u_map.get(r.get("owner_id"), f"Roster_{r.get('roster_id')}")
-
-    # Crawl transactions up to target_week + 1 to record all waiver auctions & drops
-    recently_dropped_pids = {}
-    raw_waiver_bids = []
-
-    for w_tx in range(1, target_week + 2):
-        tx_list = get_json(f"https://api.sleeper.app/v1/league/{league_id}/transactions/{w_tx}") or []
-        for tx in tx_list:
-            tx_status = tx.get("status")
-            tx_type = tx.get("type")
-
-            if tx_status == "complete" and w_tx >= max(1, target_week - 1):
-                for d_pid, d_rid in (tx.get("drops") or {}).items():
-                    recently_dropped_pids[str(d_pid)] = {"week": w_tx, "rid": d_rid}
-
-            if tx_type == "waiver" and tx_status in ["complete", "failed"]:
-                adds_dict = tx.get("adds") or {}
-                settings_dict = tx.get("settings") or {}
-                bid_amt = int(settings_dict.get("waiver_bid", 0) or 0)
-                notes_str = str((tx.get("metadata") or {}).get("notes") or "")
-                ts_val = int(tx.get("status_updated") or tx.get("created") or 0)
-
-                for a_pid, a_rid in adds_dict.items():
-                    rid_int = int(a_rid) if str(a_rid).isdigit() else 0
-                    gm_bidder = rid_to_gm_local.get(rid_int, f"Roster_{a_rid}")
-                    p_meta = players_db.get(str(a_pid), {})
-                    p_full = f"{p_meta.get('first_name', '')} {p_meta.get('last_name', '')}".strip() or str(a_pid)
-                    p_pos = p_meta.get("position", "N/A")
-                    p_team = norm_nfl_team(p_meta.get("team"))
-
-                    raw_waiver_bids.append({
-                        "Week": w_tx,
-                        "PID": str(a_pid),
-                        "Player": p_full,
-                        "Pos": p_pos,
-                        "Team": p_team,
-                        "Roster_ID": rid_int,
-                        "GM": gm_bidder,
-                        "Bid": bid_amt,
-                        "Status": tx_status,
-                        "Notes": notes_str,
-                        "Timestamp": ts_val,
-                    })
-
-    # 4. Live DynastyProcess Market Values & Positional Live Rankings
+    # 2. Live DynastyProcess Market Values & Positional Rankings
     val_map, rank_map, pos_rank_map, pos_rank_num_map = {}, {}, {}, {}
     try:
         df_val = pd.read_csv("https://raw.githubusercontent.com/dynastyprocess/data/master/files/values.csv")
@@ -291,7 +225,7 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
     except Exception:
         pass
 
-    # 5. Live Schedule, Game Clock, In-Play States & Vegas Implied Totals
+    # 3. NFL Schedule, Bye Weeks, Game Clock & Vegas Lines
     schedule_map = {}
     playing_teams_target_wk = set()
     now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -308,7 +242,6 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
             h_imp = round((tot_line / 2.0) + (spr_line / 2.0), 1)
             a_imp = round((tot_line / 2.0) - (spr_line / 2.0), 1)
 
-            # Determine game state: FINAL, IN_PLAY, or UPCOMING
             is_final = pd.notnull(r.get("home_score")) and pd.notnull(r.get("away_score"))
             g_state = "FINAL"
             if not is_final:
@@ -320,7 +253,7 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
                     time_diff = (now_utc - kickoff_dt).total_seconds()
                     if time_diff < 0:
                         g_state = "UPCOMING"
-                    elif time_diff <= 14400:  # within 4 hours
+                    elif time_diff <= 14400:
                         g_state = "IN_PLAY"
                     else:
                         g_state = "FINAL"
@@ -351,7 +284,7 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
 
     bye_teams_target_wk = sorted(list(ALL_32_NFL_TEAMS - playing_teams_target_wk)) if playing_teams_target_wk else []
 
-    # 6. Fetch Official nflverse Practice & Injury Reports
+    # 4. Official nflverse Practice & Injury Reports
     nflverse_injuries = {}
     for yr in [curr_season, curr_season - 1]:
         try:
@@ -372,7 +305,7 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
         except Exception:
             continue
 
-    # 7. Pull Weekly Usage, Granular Fantasy Points, Floor/Bust Metrics, xFP, FPOE & DvP
+    # 5. Historical Weekly Usage, Snaps, Targets, xFP & DvP
     completed_weeks = [w for w in range(max(1, target_week - lookback_weeks), target_week)] or [1]
     all_completed_season_wks = [w for w in range(1, target_week)] or [1]
     dvp_pts_allowed = defaultdict(lambda: defaultdict(list))
@@ -445,7 +378,7 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
         for idx, (dt, _) in enumerate(avg_allowed, 1):
             dvp_ranks[(dt, pos)] = idx
 
-    # 8. Enrich with nflverse WOPR, PACR, Target Share & Next Gen Separation
+    # 6. nflverse WOPR, PACR, Target Share & Next Gen Separation
     nflverse_metrics = {}
     for yr in [curr_season, curr_season - 1]:
         try:
@@ -483,19 +416,7 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
             continue
 
     return (
-        curr_season,
-        is_superflex,
-        roster_positions,
-        scoring_settings,
-        league_settings,
         players_db,
-        u_map,
-        rosters,
-        matchups,
-        prev_matchups,
-        traded_picks,
-        recently_dropped_pids,
-        raw_waiver_bids,
         trending_map,
         val_map,
         rank_map,
@@ -512,7 +433,33 @@ def fetch_all_war_room_data(league_id, target_week, lookback_weeks=3):
 
 
 # ==============================================================================
-# WAIVER BID AUDIT & GM BIDDING BEHAVIOR ENGINE
+# LAYER 2: LIVE SLEEPER LEAGUE STATE (BYPASSES CDN CACHE ON REFRESH)
+# ==============================================================================
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_live_sleeper_league(league_id, target_week, sync_token=0):
+    """Fetches live rosters, matchups, and transactions with CDN cache-busting."""
+    league_info = get_json(f"https://api.sleeper.app/v1/league/{league_id}", bust_cache=True) or {}
+    users = get_json(f"https://api.sleeper.app/v1/league/{league_id}/users", bust_cache=True) or []
+    rosters = get_json(f"https://api.sleeper.app/v1/league/{league_id}/rosters", bust_cache=True) or []
+    matchups = get_json(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{target_week}", bust_cache=True) or []
+    prev_matchups = (
+        get_json(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{max(1, target_week - 1)}", bust_cache=True)
+        or []
+    )
+    traded_picks = get_json(f"https://api.sleeper.app/v1/league/{league_id}/traded_picks", bust_cache=True) or []
+
+    transactions_by_wk = {}
+    for w_tx in range(1, target_week + 2):
+        transactions_by_wk[w_tx] = (
+            get_json(f"https://api.sleeper.app/v1/league/{league_id}/transactions/{w_tx}", bust_cache=(w_tx >= target_week - 1))
+            or []
+        )
+
+    return league_info, users, rosters, matchups, prev_matchups, traded_picks, transactions_by_wk
+
+
+# ==============================================================================
+# WAIVER BID AUDIT & GM BIDDING BEHAVIOR ENGINE (SCHEMA-SAFE)
 # ==============================================================================
 def analyze_waiver_auctions_and_gm_profiles(raw_waiver_bids, all_gm_rosters, total_faab_budget):
     dedup = {}
@@ -650,11 +597,24 @@ def analyze_waiver_auctions_and_gm_profiles(raw_waiver_bids, all_gm_rosters, tot
             "Max_Bid_By_Pos": pos_pref_str,
         })
 
-    df_auctions = pd.DataFrame(auction_audit_rows)
+    auction_cols = [
+        "Week", "Player", "Pos", "Winner_GM", "Winning_Bid", "Winning_Bid_Str",
+        "Runner_Up_GM", "Runner_Up_Bid", "Runner_Up_Bid_Str", "Overpay_Margin",
+        "Overpay_Str", "Total_Bidders", "All_Competing_Bids",
+    ]
+    df_auctions = pd.DataFrame(auction_audit_rows, columns=auction_cols)
     if not df_auctions.empty:
         df_auctions = df_auctions.sort_values(by=["Week", "Winning_Bid"], ascending=[False, False])
 
-    df_gm_profiles = pd.DataFrame(gm_profile_rows).sort_values("FAAB_Raw", ascending=False)
+    profile_cols = [
+        "GM", "Status", "Remaining_FAAB", "FAAB_Raw", "Bidder_Archetype",
+        "Total_Bids (Won-Lost)", "Max_Single_Bid", "Avg_Bid_Amount",
+        "Avg_Winning_Bid", "Max_Bid_By_Pos",
+    ]
+    df_gm_profiles = pd.DataFrame(gm_profile_rows, columns=profile_cols)
+    if not df_gm_profiles.empty:
+        df_gm_profiles = df_gm_profiles.sort_values("FAAB_Raw", ascending=False)
+
     return df_auctions, df_gm_profiles, gm_aggression_map
 
 
@@ -876,12 +836,14 @@ def build_player_profile(
 # ==============================================================================
 # SIDEBAR CONTROLS & LIFECYCLE ENGINE
 # ==============================================================================
-# Detect active operational week from Sleeper state (prioritizing 'week' over 'display_week')
-state_raw = get_json("https://api.sleeper.app/v1/state/nfl") or {}
+if "sync_token" not in st.session_state:
+    st.session_state.sync_token = 0
+
+state_raw = get_json("https://api.sleeper.app/v1/state/nfl", bust_cache=True) or {}
+curr_season = int(state_raw.get("season", 2026))
 live_nfl_week = max(1, int(state_raw.get("week") or state_raw.get("display_week") or 7))
 
-# Identify Weekly Lifecycle Phase based on day of week
-today_weekday = datetime.datetime.now().weekday()  # 0=Mon, 1=Tue, 2=Wed, ...
+today_weekday = datetime.datetime.now().weekday()
 if today_weekday == 1:
     lifecycle_banner = f"🎯 Tuesday Waiver Strategy Phase (Week {live_nfl_week} Prep)"
 elif today_weekday == 2:
@@ -908,7 +870,6 @@ with st.sidebar:
         league_id_input = st.text_input("🏆 Custom Sleeper League ID", value="1313348860042571776")
         active_mode = st.selectbox("League Strategy Mode", ["DYNASTY", "CHOP"])
 
-    # Interactive Week Selector (defaults to active week, allows jumping to any week 1-18)
     selected_week = st.selectbox(
         "📅 Select NFL Week",
         list(range(1, 19)),
@@ -945,25 +906,25 @@ with st.sidebar:
     )
 
     if st.button("⚡ Force Live Sync / Refresh", use_container_width=True):
-        st.cache_data.clear()
+        st.session_state.sync_token += 1
+        fetch_live_sleeper_league.clear()
         st.rerun()
 
-# Fetch Master Data for Active League & Selected Week
-with st.spinner(f"Syncing Week {selected_week} settings, live scores, practice reports & usage..."):
+# ==============================================================================
+# FETCH LIVE SLEEPER LEAGUE STATE & REFERENCE DATA
+# ==============================================================================
+with st.spinner(f"Syncing live Sleeper rosters & Week {selected_week} matchups..."):
+    league_info, users, rosters, matchups, prev_matchups, traded_picks, transactions_by_wk = (
+        fetch_live_sleeper_league(league_id_input.strip(), selected_week, st.session_state.sync_token)
+    )
+
+    roster_positions = league_info.get("roster_positions") or []
+    scoring_settings = league_info.get("scoring_settings") or {}
+    league_settings = league_info.get("settings") or {}
+    is_superflex = ("SUPER_FLEX" in roster_positions) or (roster_positions.count("QB") >= 2)
+
     (
-        curr_season,
-        is_superflex,
-        roster_positions,
-        scoring_settings,
-        league_settings,
         players_db,
-        u_map,
-        rosters,
-        matchups,
-        prev_matchups,
-        traded_picks,
-        recently_dropped_pids,
-        raw_waiver_bids,
         trending_map,
         val_map,
         rank_map,
@@ -976,11 +937,70 @@ with st.spinner(f"Syncing Week {selected_week} settings, live scores, practice r
         weekly_usage,
         nflverse_metrics,
         ngs_sep_map,
-    ) = fetch_all_war_room_data(league_id_input.strip(), selected_week, lookback_wks)
+    ) = fetch_reference_data(
+        curr_season,
+        selected_week,
+        lookback_wks,
+        is_superflex,
+        tuple(sorted(scoring_settings.items())),
+    )
 
 # ==============================================================================
-# PARSE SETTINGS, FAAB, IN-PLAY PMR & ROSTERS
+# PARSE SETTINGS, FAAB, IN-PLAY PMR & ROSTERS (PROPER 4-SPACE INDENTATION)
 # ==============================================================================
+u_map = {
+    u["user_id"]: normalize_gm(u.get("display_name", "User"))
+    for u in users
+    if u.get("user_id")
+}
+
+rid_to_gm = {}
+for r in rosters:
+    if r and r.get("roster_id") is not None:
+        rid_int = int(r.get("roster_id"))
+        rid_to_gm[rid_int] = u_map.get(r.get("owner_id"), f"Roster_{rid_int}")
+
+recently_dropped_pids = {}
+raw_waiver_bids = []
+
+for w_tx, tx_list in transactions_by_wk.items():
+    for tx in tx_list:
+        tx_status = tx.get("status")
+        tx_type = tx.get("type")
+
+        if tx_status == "complete" and w_tx >= max(1, selected_week - 1):
+            for d_pid, d_rid in (tx.get("drops") or {}).items():
+                recently_dropped_pids[str(d_pid)] = {"week": w_tx, "rid": d_rid}
+
+        if tx_type == "waiver" and tx_status in ["complete", "failed"]:
+            adds_dict = tx.get("adds") or {}
+            settings_dict = tx.get("settings") or {}
+            bid_amt = int(settings_dict.get("waiver_bid", 0) or 0)
+            notes_str = str((tx.get("metadata") or {}).get("notes") or "")
+            ts_val = int(tx.get("status_updated") or tx.get("created") or 0)
+
+            for a_pid, a_rid in adds_dict.items():
+                rid_int = int(a_rid) if str(a_rid).isdigit() else 0
+                gm_bidder = rid_to_gm.get(rid_int, f"Roster_{a_rid}")
+                p_meta = players_db.get(str(a_pid), {})
+                p_full = f"{p_meta.get('first_name', '')} {p_meta.get('last_name', '')}".strip() or str(a_pid)
+                p_pos = p_meta.get("position", "N/A")
+                p_team = norm_nfl_team(p_meta.get("team"))
+
+                raw_waiver_bids.append({
+                    "Week": w_tx,
+                    "PID": str(a_pid),
+                    "Player": p_full,
+                    "Pos": p_pos,
+                    "Team": p_team,
+                    "Roster_ID": rid_int,
+                    "GM": gm_bidder,
+                    "Bid": bid_amt,
+                    "Status": tx_status,
+                    "Notes": notes_str,
+                    "Timestamp": ts_val,
+                })
+
 total_faab_budget = int(league_settings.get("waiver_budget", 1000 if active_mode == "CHOP" else 100) or 100)
 max_ir_slots = int(league_settings.get("reserve_slots", 0) or 0)
 waiver_day_num = int(league_settings.get("waiver_day_of_week", 2) or 2)
@@ -1008,10 +1028,16 @@ if int(league_settings.get("reserve_allow_cov", 0) or 0) == 1:
 
 curr_wk_pts_by_rid = {}
 player_live_pts_by_rid = defaultdict(dict)
+matchup_starters_by_rid = {}
+
 for m in matchups:
     if m and m.get("roster_id") is not None:
         rid_k = int(m["roster_id"])
         curr_wk_pts_by_rid[rid_k] = float(m.get("points") or 0.0)
+        m_starters = [str(x) for x in (m.get("starters") or []) if x and str(x) != "0"]
+        if m_starters:
+            matchup_starters_by_rid[rid_k] = m_starters
+
         p_pts = m.get("players_points") or {}
         for p_id_k, pt_v in p_pts.items():
             player_live_pts_by_rid[rid_k][str(p_id_k)] = float(pt_v or 0.0)
@@ -1029,31 +1055,22 @@ my_starters_pids, my_bench_pids, my_ir_pids, my_taxi_pids = [], [], [], []
 my_roster_id = None
 my_faab_rem = total_faab_budget
 all_gm_rosters = {}
-rid_to_gm = {}
-
-matchup_starters_by_rid = {}
-for m in matchups:
-  if m and m.get("roster_id") is not None:
-    m_starters = [
-        str(x) for x in (m.get("starters") or []) if x and str(x) != "0"
-    ]
-    if m_starters:
-      matchup_starters_by_rid[int(m["roster_id"])] = m_starters
 
 for r in rosters:
-  rid = int(r.get("roster_id"))
-  gm = u_map.get(r.get("owner_id"), f"Roster_{rid}")
-  rid_to_gm[rid] = gm
+    if not r or r.get("roster_id") is None:
+        continue
+    rid = int(r.get("roster_id"))
+    gm = u_map.get(r.get("owner_id"), f"Roster_{rid}")
+    rid_to_gm[rid] = gm
 
-  pids = [str(x) for x in (r.get("players") or []) if x and str(x) != "0"]
+    pids = [str(x) for x in (r.get("players") or []) if x and str(x) != "0"]
+    roster_starters = [str(x) for x in (r.get("starters") or []) if x and str(x) != "0"]
 
-  # If matchups endpoint has starters for this specific week, use those; otherwise fallback to roster
-  if rid in matchup_starters_by_rid:
-    starters = matchup_starters_by_rid[rid]
-  else:
-    starters = [
-        str(x) for x in (r.get("starters") or []) if x and str(x) != "0"
-    ]
+    # For past weeks, use historical matchup starters; for current/future weeks, prefer live roster starters
+    if selected_week < live_nfl_week and rid in matchup_starters_by_rid:
+        starters = matchup_starters_by_rid[rid]
+    else:
+        starters = roster_starters if roster_starters else matchup_starters_by_rid.get(rid, [])
 
     ir_list = [str(x) for x in (r.get("reserve") or []) if x and str(x) != "0"]
     taxi_list = [str(x) for x in (r.get("taxi") or []) if x and str(x) != "0"]
@@ -1069,7 +1086,6 @@ for r in rosters:
     faab_rem = max(0, total_faab_budget - faab_used)
     coach_eff = round((fpts / ppts) * 100.0, 1) if ppts > 0 else 100.0
 
-    # Calculate PMR (Players Remaining: In-Play or Upcoming)
     pmr_in_play = 0
     pmr_upcoming = 0
     for s_pid in starters:
@@ -1316,8 +1332,14 @@ def build_league_positional_scout(all_gm_rosters, players_db, val_map, pos_rank_
             "TE_Studs (Top12/24)": f"{top12_counts['TE']} / {top24_counts['TE']}",
         })
 
+    scout_cols = [
+        "GM", "Record_Status", "FAAB", "Total_Val", "QB_Val", "RB_Val", "WR_Val", "TE_Val",
+        "QB_Studs (Top12/24)", "RB_Studs (Top12/24)", "WR_Studs (Top12/24)", "TE_Studs (Top12/24)",
+        "QB_League_Rank", "RB_League_Rank", "WR_League_Rank", "TE_League_Rank",
+        "QB_Rank_Unit", "RB_Rank_Unit", "WR_Rank_Unit", "TE_Rank_Unit",
+    ]
     df_pos_scout = pd.DataFrame(pos_matrix_rows)
-    if not df_pos_scout.empty:
+    if not df_pos_scout.empty and "Total_Val" in df_pos_scout.columns:
         for pos in ["QB", "RB", "WR", "TE"]:
             df_pos_scout[f"{pos}_League_Rank"] = (
                 df_pos_scout[f"{pos}_Val"].rank(ascending=False, method="min").astype(int)
@@ -1327,6 +1349,8 @@ def build_league_positional_scout(all_gm_rosters, players_db, val_map, pos_rank_
                 axis=1,
             )
         df_pos_scout = df_pos_scout.sort_values("Total_Val", ascending=False)
+    else:
+        df_pos_scout = pd.DataFrame(columns=scout_cols)
     return df_pos_scout
 
 
@@ -1351,6 +1375,10 @@ def render_rival_roster_scout_tab(tab_key_prefix):
     st.markdown("#### 🔍 Deep Team Roster Inspector (Starters, Active Bench, Taxi & IR)")
 
     alive_or_all_gms = sorted(all_gm_rosters.keys())
+    if not alive_or_all_gms:
+        st.info("No rosters available.")
+        return
+
     default_idx = next(
         (i for i, g in enumerate(alive_or_all_gms) if g.lower() != gm_input.strip().lower()),
         0,
@@ -1535,20 +1563,26 @@ if active_mode == "CHOP":
     chopped_teams = [(gm, d) for gm, d in all_gm_rosters.items() if not d["is_alive"]]
 
     any_live_pts = any(d["curr_wk_pts"] > 0 for _, d in surviving_teams)
-    if any_live_pts:
-        surviving_sorted = sorted(surviving_teams, key=lambda x: (x[1]["curr_wk_pts"], x[1]["fpts"]), reverse=True)
-        cut_line_gm, cut_line_data = surviving_sorted[-1]
-        cut_line_score = cut_line_data["curr_wk_pts"]
-        my_curr_score = all_gm_rosters.get(gm_input, {}).get("curr_wk_pts", 0.0)
-        safety_buffer = round(my_curr_score - cut_line_score, 2)
-        score_label = f"Wk {selected_week} Live Pts"
+    if surviving_teams:
+        if any_live_pts:
+            surviving_sorted = sorted(surviving_teams, key=lambda x: (x[1]["curr_wk_pts"], x[1]["fpts"]), reverse=True)
+            cut_line_gm, cut_line_data = surviving_sorted[-1]
+            cut_line_score = cut_line_data["curr_wk_pts"]
+            my_curr_score = all_gm_rosters.get(gm_input, {}).get("curr_wk_pts", 0.0)
+            safety_buffer = round(my_curr_score - cut_line_score, 2)
+            score_label = f"Wk {selected_week} Live Pts"
+        else:
+            surviving_sorted = sorted(surviving_teams, key=lambda x: x[1]["fpts"], reverse=True)
+            cut_line_gm, cut_line_data = surviving_sorted[-1]
+            cut_line_score = cut_line_data["fpts"]
+            my_curr_score = all_gm_rosters.get(gm_input, {}).get("fpts", 0.0)
+            safety_buffer = round(my_curr_score - cut_line_score, 2)
+            score_label = "Season Total Pts (Pre-Kickoff)"
     else:
-        surviving_sorted = sorted(surviving_teams, key=lambda x: x[1]["fpts"], reverse=True)
-        cut_line_gm, cut_line_data = surviving_sorted[-1]
-        cut_line_score = cut_line_data["fpts"]
-        my_curr_score = all_gm_rosters.get(gm_input, {}).get("fpts", 0.0)
-        safety_buffer = round(my_curr_score - cut_line_score, 2)
-        score_label = "Season Total Pts (Pre-Kickoff)"
+        surviving_sorted = []
+        cut_line_gm, cut_line_data = "N/A", {}
+        cut_line_score, my_curr_score, safety_buffer = 0.0, 0.0, 0.0
+        score_label = "N/A"
 
     my_pmr = all_gm_rosters.get(gm_input, {}).get("pmr_total", 0)
     cut_pmr = cut_line_data.get("pmr_total", 0)
@@ -1583,7 +1617,9 @@ if active_mode == "CHOP":
             f"Synced with Week {selected_week} status ({lifecycle_banner}), live PMR, rival positional needs, practice reports, and your **${endgame_faab_reserve} Endgame FAAB Reserve Rule**."
         )
 
-        if "chop_chat_messages" not in st.session_state:
+        chop_ctx_key = f"{league_id_input}_{selected_week}"
+        if "chop_chat_messages" not in st.session_state or st.session_state.get("chop_ctx_key") != chop_ctx_key:
+            st.session_state.chop_ctx_key = chop_ctx_key
             st.session_state.chop_chat_messages = [
                 {
                     "role": "assistant",
@@ -1675,7 +1711,7 @@ if active_mode == "CHOP":
                     st.error(f"Gemini API Error: {e}")
 
     # --------------------------------------------------------------------------
-    # CHOP TAB 2: GUILLOTINE CUT-LINE & 18-TEAM BOARD (WITH LIVE PMR)
+    # CHOP TAB 2: GUILLOTINE CUT-LINE & 18-TEAM BOARD
     # --------------------------------------------------------------------------
     with ctab2:
         st.subheader(f"🪓 Week {selected_week} Guillotine Cut-Line & Live Survival Leaderboard")
@@ -1789,7 +1825,8 @@ if active_mode == "CHOP":
             cw["🔒 Lock-In Bid (Capped)"] = lock_bids
             cw["💰 Value Saver Bid"] = val_bids
 
-            cw = cw.sort_values(by=chop_sort_col, ascending=False)
+            if not cw.empty:
+                cw = cw.sort_values(by=chop_sort_col, ascending=False)
             chop_waiver_cols = [
                 "Player", "Pos", "Pos_Rank", "Team", "Chopped_Status", "Status", "Matchup",
                 "Chop_Floor_Score", "xFP/G", "Recent_PPG", "Bust_Rate_%",
@@ -1877,7 +1914,6 @@ else:
                     [str(x) for x in (opp_m.get("starters") or []) if x and str(x) != "0"], opp_rid
                 )
 
-    # Pre-compute Max PF Draft Order & Future Pick Ownership (2027-2029)
     sorted_by_max_pf = sorted(all_gm_rosters.items(), key=lambda x: (x[1]["max_pf"], x[1]["wins"]))
     rid_to_proj_slot = {}
     for slot_idx, (orig_gm, rdata) in enumerate(sorted_by_max_pf, 1):
@@ -1970,7 +2006,9 @@ else:
             f"Synced with Week {selected_week} status ({lifecycle_banner}), practice reports, Vegas/DvP, xFP/FPOE, and positional rankings."
         )
 
-        if "dynasty_chat_messages" not in st.session_state:
+        dyn_ctx_key = f"{league_id_input}_{selected_week}"
+        if "dynasty_chat_messages" not in st.session_state or st.session_state.get("dyn_ctx_key") != dyn_ctx_key:
+            st.session_state.dyn_ctx_key = dyn_ctx_key
             st.session_state.dynasty_chat_messages = [
                 {
                     "role": "assistant",
@@ -2154,11 +2192,10 @@ else:
                 "Points_Left_On_Bench": pts_left_on_bench,
                 "Coaching_Efficiency_%": f"{d['coach_eff_%']}%",
             })
-        st.dataframe(
-            pd.DataFrame(eff_rows).sort_values("Actual_PF", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
+        eff_df = pd.DataFrame(eff_rows)
+        if not eff_df.empty:
+            eff_df = eff_df.sort_values("Actual_PF", ascending=False)
+        st.dataframe(eff_df, use_container_width=True, hide_index=True)
 
     # --------------------------------------------------------------------------
     # DYNASTY TAB 5: WAIVER RADAR, RB CONTINGENCY & AUCTION ARCHIVE
@@ -2171,15 +2208,17 @@ else:
             "Rank Free Agents By",
             ["Volume_Score", "xFP/G", "Contingency_Score", "24h_Adds", "Snap_%", "Dynasty_Val"],
         )
+        avg_rem_faab = int(np.mean([d["faab_rem"] for d in all_gm_rosters.values()])) if all_gm_rosters else 0
         w_c3.info(
-            f"💰 **Your Remaining FAAB:** `${my_faab_rem}` (League Avg Remaining: `${int(np.mean([d['faab_rem'] for d in all_gm_rosters.values()]))}`)"
+            f"💰 **Your Remaining FAAB:** `${my_faab_rem}` (League Avg Remaining: `${avg_rem_faab}`)"
         )
 
         if not df_waivers.empty:
             vw = df_waivers.copy()
             if pos_filter != "ALL":
                 vw = vw[vw["Pos"] == pos_filter]
-            vw = vw.sort_values(by=sort_waiver, ascending=False)
+            if not vw.empty:
+                vw = vw.sort_values(by=sort_waiver, ascending=False)
             w_cols = [
                 "Player", "Pos", "Pos_Rank", "Team", "Age", "Status", "Practice_Participation", "Matchup",
                 "Volume_Score", "xFP/G", "Recent_PPG", "Contingency_Score", "24h_Adds",
@@ -2251,180 +2290,200 @@ else:
             return "⚖️ Middle Tier / Pivot"
 
         rival_gms = [g for g in sorted(all_gm_rosters.keys()) if g.lower() != gm_input.strip().lower()]
-        partner_gm = st.selectbox("🤝 Select Trade Partner GM", rival_gms)
-        partner_tier = get_gm_tier(partner_gm)
-        my_tier = get_gm_tier(gm_input)
+        if not rival_gms:
+            st.info("No rival rosters found.")
+        else:
+            partner_gm = st.selectbox("🤝 Select Trade Partner GM", rival_gms)
+            partner_tier = get_gm_tier(partner_gm)
+            my_tier = get_gm_tier(gm_input)
 
-        def build_pos_grouped_assets(gm_u):
-            r_d = all_gm_rosters.get(gm_u, {})
-            pids = r_d.get("players", [])
-            df_p = build_df_from_pids(pids, r_d.get("roster_id"))
-            by_pos = {"QB": {}, "RB": {}, "WR": {}, "TE": {}, "PICK": {}}
-            if not df_p.empty:
-                df_p = df_p.sort_values("Dynasty_Val", ascending=False)
-                for _, row in df_p.iterrows():
-                    pos = row["Pos"]
-                    if pos in ["QB", "RB", "WR", "TE"]:
-                        lbl = f"{row['Player']} ({row['Pos_Rank']} | Val: {row['Dynasty_Val']:,} | {row['xFP/G']} xFP/G)"
-                        by_pos[pos][lbl] = row.to_dict()
-            for pk in gm_picks_inventory.get(gm_u, []):
-                by_pos["PICK"][pk["Label"]] = pk
-            return by_pos
+            def build_pos_grouped_assets(gm_u):
+                r_d = all_gm_rosters.get(gm_u, {})
+                pids = r_d.get("players", [])
+                df_p = build_df_from_pids(pids, r_d.get("roster_id"))
+                by_pos = {"QB": {}, "RB": {}, "WR": {}, "TE": {}, "PICK": {}}
+                if not df_p.empty:
+                    df_p = df_p.sort_values("Dynasty_Val", ascending=False)
+                    for _, row in df_p.iterrows():
+                        pos = row["Pos"]
+                        if pos in ["QB", "RB", "WR", "TE"]:
+                            lbl = f"{row['Player']} ({row['Pos_Rank']} | Val: {row['Dynasty_Val']:,} | {row['xFP/G']} xFP/G)"
+                            by_pos[pos][lbl] = row.to_dict()
+                for pk in gm_picks_inventory.get(gm_u, []):
+                    by_pos["PICK"][pk["Label"]] = pk
+                return by_pos
 
-        my_assets_by_pos = build_pos_grouped_assets(gm_input)
-        partner_assets_by_pos = build_pos_grouped_assets(partner_gm)
+            my_assets_by_pos = build_pos_grouped_assets(gm_input)
+            partner_assets_by_pos = build_pos_grouped_assets(partner_gm)
 
-        col_send, col_rec = st.columns(2)
+            col_send, col_rec = st.columns(2)
 
-        sent_items = []
-        with col_send:
-            st.markdown(f"#### 📤 Assets `{gm_input}` ({my_tier}) Sends")
-            for pos_k, pos_title in [("QB", "Quarterbacks (QB)"), ("RB", "Running Backs (RB)"), ("WR", "Wide Receivers (WR)"), ("TE", "Tight Ends (TE)"), ("PICK", "Future Draft Picks (2027-2029)")]:
-                opts = list(my_assets_by_pos[pos_k].keys())
-                sel = st.multiselect(f"Send {pos_title}", opts, key=f"send_{pos_k}")
-                for k in sel:
-                    sent_items.append(my_assets_by_pos[pos_k][k])
+            sent_items = []
+            with col_send:
+                st.markdown(f"#### 📤 Assets `{gm_input}` ({my_tier}) Sends")
+                for pos_k, pos_title in [
+                    ("QB", "Quarterbacks (QB)"),
+                    ("RB", "Running Backs (RB)"),
+                    ("WR", "Wide Receivers (WR)"),
+                    ("TE", "Tight Ends (TE)"),
+                    ("PICK", "Future Draft Picks (2027-2029)"),
+                ]:
+                    opts = list(my_assets_by_pos[pos_k].keys())
+                    sel = st.multiselect(f"Send {pos_title}", opts, key=f"send_{pos_k}")
+                    for k in sel:
+                        sent_items.append(my_assets_by_pos[pos_k][k])
 
-        rec_items = []
-        with col_rec:
-            st.markdown(f"#### 📥 Assets `{partner_gm}` ({partner_tier}) Sends")
-            for pos_k, pos_title in [("QB", "Quarterbacks (QB)"), ("RB", "Running Backs (RB)"), ("WR", "Wide Receivers (WR)"), ("TE", "Tight Ends (TE)"), ("PICK", "Future Draft Picks (2027-2029)")]:
-                opts = list(partner_assets_by_pos[pos_k].keys())
-                sel = st.multiselect(f"Receive {pos_title}", opts, key=f"rec_{pos_k}")
-                for k in sel:
-                    rec_items.append(partner_assets_by_pos[pos_k][k])
+            rec_items = []
+            with col_rec:
+                st.markdown(f"#### 📥 Assets `{partner_gm}` ({partner_tier}) Sends")
+                for pos_k, pos_title in [
+                    ("QB", "Quarterbacks (QB)"),
+                    ("RB", "Running Backs (RB)"),
+                    ("WR", "Wide Receivers (WR)"),
+                    ("TE", "Tight Ends (TE)"),
+                    ("PICK", "Future Draft Picks (2027-2029)"),
+                ]:
+                    opts = list(partner_assets_by_pos[pos_k].keys())
+                    sel = st.multiselect(f"Receive {pos_title}", opts, key=f"rec_{pos_k}")
+                    for k in sel:
+                        rec_items.append(partner_assets_by_pos[pos_k][k])
 
-        if sent_items or rec_items:
-            st.markdown("---")
-            send_val = sum(x["Dynasty_Val"] for x in sent_items)
-            get_val = sum(x["Dynasty_Val"] for x in rec_items)
-            val_delta = get_val - send_val
+            if sent_items or rec_items:
+                st.markdown("---")
+                send_val = sum(x["Dynasty_Val"] for x in sent_items)
+                get_val = sum(x["Dynasty_Val"] for x in rec_items)
+                val_delta = get_val - send_val
 
-            send_xfp = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in sent_items), 1)
-            get_xfp = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in rec_items), 1)
-            xfp_delta = round(get_xfp - send_xfp, 1)
+                send_xfp = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in sent_items), 1)
+                get_xfp = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in rec_items), 1)
+                xfp_delta = round(get_xfp - send_xfp, 1)
 
-            send_ppg = round(sum(x.get("Recent_PPG", 0.0) or 0.0 for x in sent_items), 1)
-            get_ppg = round(sum(x.get("Recent_PPG", 0.0) or 0.0 for x in rec_items), 1)
-            ppg_delta = round(get_ppg - send_ppg, 1)
+                send_ppg = round(sum(x.get("Recent_PPG", 0.0) or 0.0 for x in sent_items), 1)
+                get_ppg = round(sum(x.get("Recent_PPG", 0.0) or 0.0 for x in rec_items), 1)
+                ppg_delta = round(get_ppg - send_ppg, 1)
 
-            send_ages = [x["Age"] for x in sent_items if x.get("Age")]
-            get_ages = [x["Age"] for x in rec_items if x.get("Age")]
-            avg_send_age = round(float(np.mean(send_ages)), 1) if send_ages else 0.0
-            avg_get_age = round(float(np.mean(get_ages)), 1) if get_ages else 0.0
-            age_delta = round(avg_get_age - avg_send_age, 1) if (send_ages and get_ages) else 0.0
+                send_ages = [x["Age"] for x in sent_items if x.get("Age")]
+                get_ages = [x["Age"] for x in rec_items if x.get("Age")]
+                avg_send_age = round(float(np.mean(send_ages)), 1) if send_ages else 0.0
+                avg_get_age = round(float(np.mean(get_ages)), 1) if get_ages else 0.0
+                age_delta = round(avg_get_age - avg_send_age, 1) if (send_ages and get_ages) else 0.0
 
-            max_side = max(1, send_val, get_val)
-            pct_diff = abs(val_delta) / max_side * 100.0
-            if pct_diff <= 8.0:
-                fair_badge = "⚖️ FAIR MARKET DEAL (Within 8%)"
-            elif val_delta > 0:
-                fair_badge = f"🟢 SURPLUS WIN FOR {gm_input.upper()} (+{pct_diff:.0f}%)"
-            else:
-                fair_badge = f"🟠 SURPLUS WIN FOR {partner_gm.upper()} (+{pct_diff:.0f}%)"
-
-            st.markdown(f"### 📊 Executive Trade Outcome: {fair_badge}")
-            m_c1, m_c2, m_c3, m_c4 = st.columns(4)
-            m_c1.metric("You Receive (Dynasty Val)", f"{get_val:,}", delta=f"{val_delta:+,} Net Value vs Sent ({send_val:,})")
-            m_c2.metric("Weekly Volume Impact (xFP/G)", f"{get_xfp:.1f} xFP/G", delta=f"{xfp_delta:+.1f} xFP/G vs Sent ({send_xfp:.1f})")
-            m_c3.metric("Weekly Scoring Impact (PPG)", f"{get_ppg:.1f} PPG", delta=f"{ppg_delta:+.1f} PPG vs Sent ({send_ppg:.1f})")
-            m_c4.metric("Avg Player Age Acquired", f"{avg_get_age:.1f} yrs" if avg_get_age > 0 else "Picks Only", delta=f"{age_delta:+.1f} yrs vs Sent" if (send_ages and get_ages) else None, delta_color="inverse")
-
-            pos_breakdown_rows = []
-            for p_cat in ["QB", "RB", "WR", "TE", "PICK"]:
-                s_cat = [x for x in sent_items if x["Pos"] == p_cat]
-                r_cat = [x for x in rec_items if x["Pos"] == p_cat]
-                if not s_cat and not r_cat:
-                    continue
-                s_names = " + ".join([x.get("Player") or x.get("Short_Label") for x in s_cat]) or "None"
-                r_names = " + ".join([x.get("Player") or x.get("Short_Label") for x in r_cat]) or "None"
-                s_v = sum(x["Dynasty_Val"] for x in s_cat)
-                r_v = sum(x["Dynasty_Val"] for x in r_cat)
-                s_x = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in s_cat), 1)
-                r_x = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in r_cat), 1)
-                pos_breakdown_rows.append({
-                    "Position_Group": "Draft Capital" if p_cat == "PICK" else p_cat,
-                    f"{gm_input}_Sends": s_names,
-                    "Sent_Val": f"{s_v:,}",
-                    "Sent_xFP/G": f"{s_x:.1f}",
-                    f"{gm_input}_Receives": r_names,
-                    "Received_Val": f"{r_v:,}",
-                    "Received_xFP/G": f"{r_x:.1f}",
-                    "Net_Positional_Delta": f"{r_v - s_v:+,} val ({r_x - s_x:+.1f} xFP/G)",
-                })
-
-            st.markdown("#### 🧩 Positional Package Breakdown")
-            st.dataframe(pd.DataFrame(pos_breakdown_rows), use_container_width=True, hide_index=True)
-
-            st.markdown("#### 💬 Ready-to-Send Trade Pitch for Your Trade Partner")
-            sent_names_clean = ", ".join([x.get("Player") or x.get("Short_Label") for x in sent_items]) or "None"
-            rec_names_clean = ", ".join([x.get("Player") or x.get("Short_Label") for x in rec_items]) or "None"
-
-            partner_weak_pos = []
-            if not df_league_pos_scout.empty:
-                p_sc_row = df_league_pos_scout[df_league_pos_scout["GM"] == partner_gm]
-                if not p_sc_row.empty:
-                    for pos_c in ["QB", "RB", "WR", "TE"]:
-                        rk_c = int(p_sc_row.iloc[0][f"{pos_c}_League_Rank"])
-                        if rk_c >= 7:
-                            partner_weak_pos.append(f"{pos_c} (Ranked #{rk_c} in league)")
-
-            pitch_points = []
-            if send_val >= get_val:
-                pitch_points.append(
-                    f"• **Positive Dynasty Value for {partner_gm}:** You gain **+{send_val - get_val:,} in consensus Dynasty market value** ({send_val:,} vs {get_val:,})."
-                )
-            else:
-                pitch_points.append(
-                    f"• **Balanced Core Consolidation:** Total Dynasty market value is closely aligned ({send_val:,} to {get_val:,}) while addressing starting lineup needs."
-                )
-
-            if send_xfp > get_xfp:
-                pitch_points.append(
-                    f"• **Immediate Weekly Scoring Boost for {partner_gm}:** The players you receive add **+{send_xfp - get_xfp:.1f} Expected Fantasy Points per game** ({send_xfp:.1f} xFP/G vs {get_xfp:.1f} xFP/G)."
-                )
-            if any(x["Pos"] == "PICK" for x in sent_items):
-                picks_sent_str = ", ".join([x["Short_Label"] for x in sent_items if x["Pos"] == "PICK"])
-                pitch_points.append(
-                    f"• **Insulated Future Draft Capital:** You secure liquid draft capital (**{picks_sent_str}**) that appreciates heading into the rookie draft and never suffers injuries."
-                )
-            if partner_weak_pos:
-                pitch_points.append(
-                    f"• **Addresses Your Roster Needs:** Directly reinforces your positional depth ({', '.join(partner_weak_pos)})."
-                )
-
-            copy_paste_msg = (
-                f"Hey {partner_gm}! Put together a trade idea that fits both of our rosters:\n\n"
-                f"• You Receive: {sent_names_clean} (Dynasty Value: {send_val:,} | {send_xfp:.1f} xFP/G)\n"
-                f"• I Receive: {rec_names_clean} (Dynasty Value: {get_val:,} | {get_xfp:.1f} xFP/G)\n\n"
-                f"Why it makes sense for your squad ({partner_tier}):\n" + "\n".join([p.replace("**", "") for p in pitch_points])
-            )
-
-            for pt in pitch_points:
-                st.markdown(pt)
-
-            st.code(copy_paste_msg, language="text")
-
-            if st.button("✨ Generate Custom AI Persuasion Pitch for This Deal", use_container_width=True):
-                if not api_key:
-                    st.warning("Please enter your Gemini API Key in the sidebar to generate a custom AI pitch.")
+                max_side = max(1, send_val, get_val)
+                pct_diff = abs(val_delta) / max_side * 100.0
+                if pct_diff <= 8.0:
+                    fair_badge = "⚖️ FAIR MARKET DEAL (Within 8%)"
+                elif val_delta > 0:
+                    fair_badge = f"🟢 SURPLUS WIN FOR {gm_input.upper()} (+{pct_diff:.0f}%)"
                 else:
-                    pitch_prompt = f"""
-                    Write a persuasive, friendly, data-backed 2-paragraph trade message from '{gm_input}' ({my_tier}) to '{partner_gm}' ({partner_tier}) pitching this exact Dynasty trade:
-                    - {partner_gm} Receives: {sent_items} (Total Val: {send_val}, Total xFP/G: {send_xfp})
-                    - {gm_input} Receives: {rec_items} (Total Val: {get_val}, Total xFP/G: {get_xfp})
-                    - {partner_gm}'s Positional Weaknesses in League: {partner_weak_pos}
-                    Highlight exact snap %, xFP/G, positional ranks, or projected draft pick slots to show why this is a win-win deal for {partner_gm}. Keep it natural and ready to send in Sleeper chat.
-                    """
-                    try:
-                        client = genai.Client(api_key=api_key)
-                        with st.spinner("Crafting custom GM trade pitch..."):
-                            ai_pitch, _ = generate_ai_response_with_fallback(
-                                client,
-                                model_choice,
-                                pitch_prompt,
-                                "You are an expert Dynasty Fantasy Football negotiator. Write in clear, persuasive English.",
-                            )
-                            st.info(ai_pitch)
-                    except Exception as e:
-                        st.error(f"Gemini API Error: {e}")
+                    fair_badge = f"🟠 SURPLUS WIN FOR {partner_gm.upper()} (+{pct_diff:.0f}%)"
+
+                st.markdown(f"### 📊 Executive Trade Outcome: {fair_badge}")
+                m_c1, m_c2, m_c3, m_c4 = st.columns(4)
+                m_c1.metric("You Receive (Dynasty Val)", f"{get_val:,}", delta=f"{val_delta:+,} Net Value vs Sent ({send_val:,})")
+                m_c2.metric("Weekly Volume Impact (xFP/G)", f"{get_xfp:.1f} xFP/G", delta=f"{xfp_delta:+.1f} xFP/G vs Sent ({send_xfp:.1f})")
+                m_c3.metric("Weekly Scoring Impact (PPG)", f"{get_ppg:.1f} PPG", delta=f"{ppg_delta:+.1f} PPG vs Sent ({send_ppg:.1f})")
+                m_c4.metric(
+                    "Avg Player Age Acquired",
+                    f"{avg_get_age:.1f} yrs" if avg_get_age > 0 else "Picks Only",
+                    delta=f"{age_delta:+.1f} yrs vs Sent" if (send_ages and get_ages) else None,
+                    delta_color="inverse",
+                )
+
+                pos_breakdown_rows = []
+                for p_cat in ["QB", "RB", "WR", "TE", "PICK"]:
+                    s_cat = [x for x in sent_items if x["Pos"] == p_cat]
+                    r_cat = [x for x in rec_items if x["Pos"] == p_cat]
+                    if not s_cat and not r_cat:
+                        continue
+                    s_names = " + ".join([x.get("Player") or x.get("Short_Label") for x in s_cat]) or "None"
+                    r_names = " + ".join([x.get("Player") or x.get("Short_Label") for x in r_cat]) or "None"
+                    s_v = sum(x["Dynasty_Val"] for x in s_cat)
+                    r_v = sum(x["Dynasty_Val"] for x in r_cat)
+                    s_x = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in s_cat), 1)
+                    r_x = round(sum(x.get("xFP/G", 0.0) or 0.0 for x in r_cat), 1)
+                    pos_breakdown_rows.append({
+                        "Position_Group": "Draft Capital" if p_cat == "PICK" else p_cat,
+                        f"{gm_input}_Sends": s_names,
+                        "Sent_Val": f"{s_v:,}",
+                        "Sent_xFP/G": f"{s_x:.1f}",
+                        f"{gm_input}_Receives": r_names,
+                        "Received_Val": f"{r_v:,}",
+                        "Received_xFP/G": f"{r_x:.1f}",
+                        "Net_Positional_Delta": f"{r_v - s_v:+,} val ({r_x - s_x:+.1f} xFP/G)",
+                    })
+
+                st.markdown("#### 🧩 Positional Package Breakdown")
+                st.dataframe(pd.DataFrame(pos_breakdown_rows), use_container_width=True, hide_index=True)
+
+                st.markdown("#### 💬 Ready-to-Send Trade Pitch for Your Trade Partner")
+                sent_names_clean = ", ".join([x.get("Player") or x.get("Short_Label") for x in sent_items]) or "None"
+                rec_names_clean = ", ".join([x.get("Player") or x.get("Short_Label") for x in rec_items]) or "None"
+
+                partner_weak_pos = []
+                if not df_league_pos_scout.empty:
+                    p_sc_row = df_league_pos_scout[df_league_pos_scout["GM"] == partner_gm]
+                    if not p_sc_row.empty:
+                        for pos_c in ["QB", "RB", "WR", "TE"]:
+                            rk_c = int(p_sc_row.iloc[0][f"{pos_c}_League_Rank"])
+                            if rk_c >= 7:
+                                partner_weak_pos.append(f"{pos_c} (Ranked #{rk_c} in league)")
+
+                pitch_points = []
+                if send_val >= get_val:
+                    pitch_points.append(
+                        f"• **Positive Dynasty Value for {partner_gm}:** You gain **+{send_val - get_val:,} in consensus Dynasty market value** ({send_val:,} vs {get_val:,})."
+                    )
+                else:
+                    pitch_points.append(
+                        f"• **Balanced Core Consolidation:** Total Dynasty market value is closely aligned ({send_val:,} to {get_val:,}) while addressing starting lineup needs."
+                    )
+
+                if send_xfp > get_xfp:
+                    pitch_points.append(
+                        f"• **Immediate Weekly Scoring Boost for {partner_gm}:** The players you receive add **+{send_xfp - get_xfp:.1f} Expected Fantasy Points per game** ({send_xfp:.1f} xFP/G vs {get_xfp:.1f} xFP/G)."
+                    )
+                if any(x["Pos"] == "PICK" for x in sent_items):
+                    picks_sent_str = ", ".join([x["Short_Label"] for x in sent_items if x["Pos"] == "PICK"])
+                    pitch_points.append(
+                        f"• **Insulated Future Draft Capital:** You secure liquid draft capital (**{picks_sent_str}**) that appreciates heading into the rookie draft and never suffers injuries."
+                    )
+                if partner_weak_pos:
+                    pitch_points.append(
+                        f"• **Addresses Your Roster Needs:** Directly reinforces your positional depth ({', '.join(partner_weak_pos)})."
+                    )
+
+                copy_paste_msg = (
+                    f"Hey {partner_gm}! Put together a trade idea that fits both of our rosters:\n\n"
+                    f"• You Receive: {sent_names_clean} (Dynasty Value: {send_val:,} | {send_xfp:.1f} xFP/G)\n"
+                    f"• I Receive: {rec_names_clean} (Dynasty Value: {get_val:,} | {get_xfp:.1f} xFP/G)\n\n"
+                    f"Why it makes sense for your squad ({partner_tier}):\n" + "\n".join([p.replace("**", "") for p in pitch_points])
+                )
+
+                for pt in pitch_points:
+                    st.markdown(pt)
+
+                st.code(copy_paste_msg, language="text")
+
+                if st.button("✨ Generate Custom AI Persuasion Pitch for This Deal", use_container_width=True):
+                    if not api_key:
+                        st.warning("Please enter your Gemini API Key in the sidebar to generate a custom AI pitch.")
+                    else:
+                        pitch_prompt = f"""
+                        Write a persuasive, friendly, data-backed 2-paragraph trade message from '{gm_input}' ({my_tier}) to '{partner_gm}' ({partner_tier}) pitching this exact Dynasty trade:
+                        - {partner_gm} Receives: {sent_items} (Total Val: {send_val}, Total xFP/G: {send_xfp})
+                        - {gm_input} Receives: {rec_items} (Total Val: {get_val}, Total xFP/G: {get_xfp})
+                        - {partner_gm}'s Positional Weaknesses in League: {partner_weak_pos}
+                        Highlight exact snap %, xFP/G, positional ranks, or projected draft pick slots to show why this is a win-win deal for {partner_gm}. Keep it natural and ready to send in Sleeper chat.
+                        """
+                        try:
+                            client = genai.Client(api_key=api_key)
+                            with st.spinner("Crafting custom GM trade pitch..."):
+                                ai_pitch, _ = generate_ai_response_with_fallback(
+                                    client,
+                                    model_choice,
+                                    pitch_prompt,
+                                    "You are an expert Dynasty Fantasy Football negotiator. Write in clear, persuasive English.",
+                                )
+                                st.info(ai_pitch)
+                        except Exception as e:
+                            st.error(f"Gemini API Error: {e}")
