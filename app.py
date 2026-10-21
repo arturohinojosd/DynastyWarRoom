@@ -149,10 +149,10 @@ def calc_expected_fp(st_d, scoring, pos):
         xfp = 0.0
     return round(xfp, 2)
 
-
 def generate_ai_response_with_fallback(client, primary_model, prompt_text, sys_instruction):
+    """Calls Gemini API with automatic fallback across models if 503 UNAVAILABLE or 404 occurs."""
     candidate_models = []
-    for m in [primary_model, "gemini-3.8-flash", "gemini-2.0-flash", "gemini-2.5-pro"]:
+    for m in [primary_model, "gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-2.0-flash"]:
         if m not in candidate_models:
             candidate_models.append(m)
 
@@ -940,8 +940,10 @@ with st.sidebar:
     )
     model_choice = st.selectbox(
         "🤖 Gemini Model (Auto-Fallback Enabled)",
-        ["gemini-3.8-flash", "gemini-2.0-flash", "gemini-2.5-pro"],
+        ["gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-2.0-flash"],
         index=0,
+    )
+
     )
 
     if st.button("⚡ Force Live Sync / Refresh", use_container_width=True):
