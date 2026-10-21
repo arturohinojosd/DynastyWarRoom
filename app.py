@@ -944,8 +944,6 @@ with st.sidebar:
         index=0,
     )
 
-    )
-
     if st.button("⚡ Force Live Sync / Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
