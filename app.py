@@ -1713,7 +1713,7 @@ else:
     k5.metric("Coaching Efficiency", f"{my_eff}%")
 
 # Shared Column Configuration for Clean Visual Progress Bars
- SHARED_COL_CFG = {
+SHARED_COL_CFG = {
     "Snap_%": st.column_config.ProgressColumn("Snap %", format="%.1f%%", min_value=0, max_value=100),
     "Volume_Score": st.column_config.ProgressColumn("Vol Score", format="%.1f", min_value=0, max_value=100),
     "Chop_Floor_Score": st.column_config.ProgressColumn("Floor Score", format="%.1f", min_value=0, max_value=100),
