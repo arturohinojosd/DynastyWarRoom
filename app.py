@@ -57,13 +57,19 @@ WAIVER_DAY_MAP = {
 # HELPER UTILITIES
 # ==============================================================================
 def get_json(url):
-    try:
-        r = requests.get(url, timeout=12)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return None
+  try:
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    r = requests.get(url, headers=headers, timeout=12)
+    if r.status_code == 200:
+      return r.json()
+  except Exception:
+    pass
+  return None
+
 
 
 def clean_name(name_str):
@@ -1025,13 +1031,30 @@ my_faab_rem = total_faab_budget
 all_gm_rosters = {}
 rid_to_gm = {}
 
-for r in rosters:
-    rid = int(r.get("roster_id"))
-    gm = u_map.get(r.get("owner_id"), f"Roster_{rid}")
-    rid_to_gm[rid] = gm
+matchup_starters_by_rid = {}
+for m in matchups:
+  if m and m.get("roster_id") is not None:
+    m_starters = [
+        str(x) for x in (m.get("starters") or []) if x and str(x) != "0"
+    ]
+    if m_starters:
+      matchup_starters_by_rid[int(m["roster_id"])] = m_starters
 
-    pids = [str(x) for x in (r.get("players") or []) if x and str(x) != "0"]
-    starters = [str(x) for x in (r.get("starters") or []) if x and str(x) != "0"]
+for r in rosters:
+  rid = int(r.get("roster_id"))
+  gm = u_map.get(r.get("owner_id"), f"Roster_{rid}")
+  rid_to_gm[rid] = gm
+
+  pids = [str(x) for x in (r.get("players") or []) if x and str(x) != "0"]
+
+  # If matchups endpoint has starters for this specific week, use those; otherwise fallback to roster
+  if rid in matchup_starters_by_rid:
+    starters = matchup_starters_by_rid[rid]
+  else:
+    starters = [
+        str(x) for x in (r.get("starters") or []) if x and str(x) != "0"
+    ]
+
     ir_list = [str(x) for x in (r.get("reserve") or []) if x and str(x) != "0"]
     taxi_list = [str(x) for x in (r.get("taxi") or []) if x and str(x) != "0"]
     active_bench = [p for p in pids if p not in starters and p not in ir_list and p not in taxi_list]
