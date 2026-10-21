@@ -119,8 +119,6 @@ def generate_ai_response_with_fallback(
 
   raise last_err
 
-]
-
 
 # ==============================================================================
 # HELPER UTILITIES & SILENT AI CASCADE
