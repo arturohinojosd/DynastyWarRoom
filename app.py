@@ -58,7 +58,6 @@ AI_MODEL_CASCADE = [
     "gemini-3.8-flash",
     "gemini-3.1-pro-preview",
     "gemini-3.8-flash-lite",
-    "gemini-3.0-flash",
 ]
 def generate_ai_response_with_fallback(
     client, preferred_model, prompt_text, sys_instruction
