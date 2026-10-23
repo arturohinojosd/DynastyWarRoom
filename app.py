@@ -10,10 +10,12 @@ from google import genai
 from google.genai import types
 
 # ==============================================================================
-# PAGE CONFIGURATION & LEAGUE PRESETS
+# VERSION 5.0 — PAGE CONFIGURATION & LEAGUE PRESETS
 # ==============================================================================
+APP_VERSION = "v5.0 (Dual Ranks, Player Inspector & Glossaries)"
+
 st.set_page_config(
-    page_title="Dynasty & Chop War Room",
+    page_title="Dynasty & Chop War Room v5.0",
     page_icon="🏈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -60,77 +62,13 @@ AI_MODEL_CASCADE = [
     "gemini-3.5-flash-lite",
     "gemini-3.1-pro-preview",
 ]
-def generate_ai_response_with_fallback(
-    client, preferred_model, prompt_text, sys_instruction
-):
-  """Dynamically discovers all models available to your API key, prioritizes
-
-  highest versions first, and retries with exponential backoff on 503 high-demand
-  spikes.
-  """
-  # 1. Build candidate list starting with preferred + cascade
-  candidate_models = []
-  for m in [preferred_model] + AI_MODEL_CASCADE:
-    if m and m not in candidate_models:
-      candidate_models.append(m)
-
-  # 2. Dynamically append any other active generateContent models from your API key
-  try:
-    for m_obj in client.models.list():
-      m_id = getattr(m_obj, "name", "").replace("models/", "")
-      if "gemini" in m_id and "embedding" not in m_id and "imagen" not in m_id:
-        if m_id not in candidate_models:
-          candidate_models.append(m_id)
-  except Exception:
-    pass
-
-  last_err = None
-  # 3. Two full passes with backoff so temporary 503 spikes resolve automatically
-  for attempt in range(2):
-    for m_name in candidate_models:
-      try:
-        response = client.models.generate_content(
-            model=m_name,
-            contents=prompt_text,
-            config=types.GenerateContentConfig(
-                system_instruction=sys_instruction,
-                temperature=0.25,
-            ),
-        )
-        if response and response.text:
-          return response.text, m_name
-      except Exception as e:
-        last_err = e
-        err_str = str(e).upper()
-        if "API_KEY_INVALID" in err_str or "INVALID API KEY" in err_str:
-          raise e
-        # If 503 high demand, pause briefly and retry the same working model once before moving on
-        if "503" in err_str or "UNAVAILABLE" in err_str:
-          time.sleep(1.5)
-          try:
-            retry_resp = client.models.generate_content(
-                model=m_name,
-                contents=prompt_text,
-                config=types.GenerateContentConfig(
-                    system_instruction=sys_instruction,
-                    temperature=0.25,
-                ),
-            )
-            if retry_resp and retry_resp.text:
-              return retry_resp.text, m_name
-          except Exception:
-            pass
-        continue
-    time.sleep(1.0)
-
-  raise last_err
 
 
 # ==============================================================================
-# HELPER UTILITIES & SILENT AI CASCADE
+# HELPER UTILITIES & SELF-VERIFYING SILENT AI CASCADE
 # ==============================================================================
 def get_json(url, bust_cache=False):
-    """Fetches JSON from URL; appends a timestamp query param when bust_cache=True to bypass CDN cache."""
+    """Fetches JSON from URL; appends a timestamp query param when bust_cache=True."""
     try:
         target_url = url
         if bust_cache:
@@ -229,35 +167,83 @@ def calc_expected_fp(st_d, scoring, pos):
 
 def generate_ai_response_with_fallback(client, preferred_model, prompt_text, sys_instruction):
     """
-    Prioritizes highest-version AI models first (gemini-3.1-pro-preview -> gemini-3.8-flash -> etc.)
-    and silently falls back to the next available model if free-tier quota (429), demand (503), or 404 is hit.
+    Verifies active models on your API key first to eliminate 404 errors,
+    prioritizes highest-version Pro/Flash models, and auto-retries on 503 demand spikes.
     """
+    available_key_models = set()
+    discovered_ordered = []
+    try:
+        for m_obj in client.models.list():
+            m_id = getattr(m_obj, "name", "").replace("models/", "")
+            methods = getattr(m_obj, "supported_actions", None) or getattr(m_obj, "supported_generation_methods", []) or []
+            if "gemini" in m_id and not any(x in m_id for x in ["embedding", "imagen", "tts", "audio", "vision"]):
+                if not methods or "generateContent" in str(methods):
+                    available_key_models.add(m_id)
+                    discovered_ordered.append(m_id)
+    except Exception:
+        pass
+
+    # Sort discovered models so higher versions & Pro/Flash come first
+    discovered_ordered.sort(
+        key=lambda x: (
+            "3." in x,
+            "2.5" in x,
+            "pro" in x,
+            "flash" in x and "lite" not in x,
+            x,
+        ),
+        reverse=True,
+    )
+
     candidate_models = []
-    for m in [preferred_model] + AI_MODEL_CASCADE:
+    for m in [preferred_model] + AI_MODEL_CASCADE + discovered_ordered:
         if m and m not in candidate_models:
-            candidate_models.append(m)
+            # If we successfully listed models, only include models verified to exist on this key
+            if not available_key_models or m in available_key_models:
+                candidate_models.append(m)
+
+    if not candidate_models:
+        candidate_models = list(AI_MODEL_CASCADE)
 
     last_err = None
-    for m_name in candidate_models:
-        try:
-            response = client.models.generate_content(
-                model=m_name,
-                contents=prompt_text,
-                config=types.GenerateContentConfig(
-                    system_instruction=sys_instruction,
-                    temperature=0.25,
-                ),
-            )
-            if response and response.text:
-                return response.text, m_name
-        except Exception as e:
-            last_err = e
-            err_str = str(e).upper()
-            # If key itself is invalid, stop immediately; otherwise silently cascade to next model
-            if "API_KEY_INVALID" in err_str or "INVALID API KEY" in err_str:
-                break
-            continue
-    raise last_err
+    for attempt in range(2):
+        for m_name in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=m_name,
+                    contents=prompt_text,
+                    config=types.GenerateContentConfig(
+                        system_instruction=sys_instruction,
+                        temperature=0.25,
+                    ),
+                )
+                if response and response.text:
+                    return response.text, m_name
+            except Exception as e:
+                err_str = str(e).upper()
+                if "API_KEY_INVALID" in err_str or "INVALID API KEY" in err_str:
+                    raise e
+                if "404" not in err_str:
+                    last_err = e
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    time.sleep(1.5)
+                    try:
+                        retry_resp = client.models.generate_content(
+                            model=m_name,
+                            contents=prompt_text,
+                            config=types.GenerateContentConfig(
+                                system_instruction=sys_instruction,
+                                temperature=0.25,
+                            ),
+                        )
+                        if retry_resp and retry_resp.text:
+                            return retry_resp.text, m_name
+                    except Exception as re_e:
+                        last_err = re_e
+                continue
+        time.sleep(1.0)
+
+    raise last_err if last_err else RuntimeError("All AI models temporarily busy. Please try again in a few seconds.")
 
 
 # ==============================================================================
@@ -383,7 +369,8 @@ def fetch_reference_data(curr_season, target_week, lookback_weeks, is_superflex,
 
     weekly_usage = defaultdict(lambda: {
         "wks": 0, "snap_pcts": [], "tgts": [], "carries": [], "rz_touches": [],
-        "air_yds": [], "rec_yds": [], "fds": [], "pts": [], "xfp": [], "all_season_pts": []
+        "air_yds": [], "rec_yds": [], "fds": [], "pts": [], "xfp": [],
+        "all_season_pts": [], "game_log": []
     })
 
     for w in all_completed_season_wks:
@@ -405,10 +392,12 @@ def fetch_reference_data(curr_season, target_week, lookback_weeks, is_superflex,
             off_snp = float(st_d.get("off_snp", 0.0) or 0.0)
             tm_snp = float(st_d.get("tm_off_snp", 0.0) or 0.0)
             tgt = float(st_d.get("rec_tgt", 0.0) or 0.0)
+            rec = float(st_d.get("rec", 0.0) or 0.0)
             car = float(st_d.get("rush_att", 0.0) or 0.0)
             rz_t = float(st_d.get("rec_rz_tgt", 0.0) or 0.0) + float(st_d.get("rush_rz_att", 0.0) or 0.0)
             air = float(st_d.get("rec_air_yd", 0.0) or 0.0)
             rec_yd = float(st_d.get("rec_yd", 0.0) or 0.0)
+            rush_yd = float(st_d.get("rush_yd", 0.0) or 0.0)
             fd = float(st_d.get("rec_fd", 0.0) or 0.0) + float(st_d.get("rush_fd", 0.0) or 0.0)
 
             custom_pts = calc_custom_fantasy_pts(st_d, scoring_settings, pos)
@@ -418,26 +407,57 @@ def fetch_reference_data(curr_season, target_week, lookback_weeks, is_superflex,
                 team_pos_pts_wk[(tm, pos)] += custom_pts
 
             if off_snp > 0 or tgt > 0 or car > 0 or custom_pts > 0:
-                weekly_usage[str(pid)]["all_season_pts"].append(custom_pts)
-
-            if w in completed_weeks and (off_snp > 0 or tgt > 0 or car > 0 or custom_pts > 0):
-                snap_pct = (off_snp / tm_snp * 100.0) if tm_snp > 0 else 0.0
+                snap_pct = round((off_snp / tm_snp * 100.0), 1) if tm_snp > 0 else 0.0
+                opp_wk = (schedule_map.get((w, tm)) or {}).get("opp", "OPP")
                 u_rec = weekly_usage[str(pid)]
-                u_rec["wks"] += 1
-                u_rec["snap_pcts"].append(snap_pct)
-                u_rec["tgts"].append(tgt)
-                u_rec["carries"].append(car)
-                u_rec["rz_touches"].append(rz_t)
-                u_rec["air_yds"].append(air)
-                u_rec["rec_yds"].append(rec_yd)
-                u_rec["fds"].append(fd)
-                u_rec["pts"].append(custom_pts)
-                u_rec["xfp"].append(xfp_val)
+                u_rec["all_season_pts"].append(custom_pts)
+                u_rec["game_log"].append({
+                    "Week": f"Wk {w}",
+                    "Opp": opp_wk,
+                    "Pts": custom_pts,
+                    "xFP": xfp_val,
+                    "Snap_%": snap_pct,
+                    "Tgt": int(tgt),
+                    "Rec": int(rec),
+                    "Rec_Yd": int(rec_yd),
+                    "Car": int(car),
+                    "Rush_Yd": int(rush_yd),
+                    "RZ_Touch": int(rz_t),
+                })
+
+                if w in completed_weeks:
+                    u_rec["wks"] += 1
+                    u_rec["snap_pcts"].append(snap_pct)
+                    u_rec["tgts"].append(tgt)
+                    u_rec["carries"].append(car)
+                    u_rec["rz_touches"].append(rz_t)
+                    u_rec["air_yds"].append(air)
+                    u_rec["rec_yds"].append(rec_yd)
+                    u_rec["fds"].append(fd)
+                    u_rec["pts"].append(custom_pts)
+                    u_rec["xfp"].append(xfp_val)
 
         for (off_tm, pos), tot_p in team_pos_pts_wk.items():
             opp_def = (schedule_map.get((w, off_tm)) or {}).get("opp")
             if opp_def and opp_def in ALL_32_NFL_TEAMS:
                 dvp_pts_allowed[opp_def][pos].append(tot_p)
+
+    # Calculate Current-Season Sleeper Positional Rankings (Actual League Scoring)
+    season_totals_by_pos = defaultdict(list)
+    for pid_s, u_d in weekly_usage.items():
+        pts_list = u_d.get("all_season_pts", [])
+        if pts_list:
+            p_pos = (players_db.get(pid_s) or {}).get("position", "N/A")
+            if p_pos in ["QB", "RB", "WR", "TE"]:
+                season_totals_by_pos[p_pos].append((pid_s, round(sum(pts_list), 1), round(float(np.mean(pts_list)), 1)))
+
+    sleeper_season_rank_map = {}
+    sleeper_season_rank_num = {}
+    for pos_k, plist in season_totals_by_pos.items():
+        plist.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        for rk_i, (pid_s, tot_p, avg_p) in enumerate(plist, 1):
+            sleeper_season_rank_map[pid_s] = f"{pos_k}{rk_i} ({avg_p} PPG)"
+            sleeper_season_rank_num[pid_s] = rk_i
 
     dvp_ranks = {}
     for pos in ["QB", "RB", "WR", "TE"]:
@@ -492,6 +512,8 @@ def fetch_reference_data(curr_season, target_week, lookback_weeks, is_superflex,
         rank_map,
         pos_rank_map,
         pos_rank_num_map,
+        sleeper_season_rank_map,
+        sleeper_season_rank_num,
         schedule_map,
         bye_teams_target_wk,
         nflverse_injuries,
@@ -503,7 +525,7 @@ def fetch_reference_data(curr_season, target_week, lookback_weeks, is_superflex,
 
 
 # ==============================================================================
-# LAYER 2: LIVE SLEEPER LEAGUE STATE (BYPASSES CDN CACHE ON REFRESH)
+# LAYER 2: LIVE SLEEPER LEAGUE STATE & WAIVER AUCTION ENGINE
 # ==============================================================================
 @st.cache_data(ttl=45, show_spinner=False)
 def fetch_live_sleeper_league(league_id, target_week, sync_token=0):
@@ -530,9 +552,6 @@ def fetch_live_sleeper_league(league_id, target_week, sync_token=0):
     return league_info, users, rosters, matchups, prev_matchups, traded_picks, transactions_by_wk
 
 
-# ==============================================================================
-# WAIVER BID AUDIT & GM BIDDING BEHAVIOR ENGINE
-# ==============================================================================
 def analyze_waiver_auctions_and_gm_profiles(raw_waiver_bids, all_gm_rosters, total_faab_budget):
     dedup = {}
     for b in raw_waiver_bids:
@@ -547,7 +566,6 @@ def analyze_waiver_auctions_and_gm_profiles(raw_waiver_bids, all_gm_rosters, tot
                 dedup[key] = b
 
     clean_bids = list(dedup.values())
-
     auctions_by_player_wk = defaultdict(list)
     for b in clean_bids:
         auctions_by_player_wk[(b["Week"], b["PID"])].append(b)
@@ -698,6 +716,8 @@ def build_player_profile(
     rank_map,
     pos_rank_map,
     pos_rank_num_map,
+    sleeper_season_rank_map,
+    sleeper_season_rank_num,
     schedule_map,
     bye_teams_target_wk,
     nflverse_injuries,
@@ -715,6 +735,10 @@ def build_player_profile(
     team = norm_nfl_team(p.get("team"))
     age = float(p.get("age") or 0.0)
     depth_order = int(p.get("depth_chart_order") or 9)
+    depth_pos = str(p.get("depth_chart_position") or pos)
+    depth_str = f"#{depth_order} {depth_pos}" if depth_order < 9 else "Reserve / Rot"
+    years_exp = int(p.get("years_exp") or 0)
+    college = str(p.get("college") or "N/A")
     raw_inj = p.get("injury_status") or ""
     cn = clean_name(full)
 
@@ -781,6 +805,8 @@ def build_player_profile(
     rnk = rank_map.get(cn, 999)
     pos_rnk_str = pos_rank_map.get(cn, f"{pos}-")
     pos_rnk_num = pos_rank_num_map.get(cn, 999)
+    sleeper_rk_str = sleeper_season_rank_map.get(str(pid), f"{pos}- (0.0)")
+    sleeper_rk_num = sleeper_season_rank_num.get(str(pid), 999)
     trend_adds = trending_map.get(str(pid), 0)
 
     u = weekly_usage.get(str(pid), {})
@@ -798,6 +824,7 @@ def build_player_profile(
     fpoe = round(ppg - xfp_g, 1)
 
     all_pts = u.get("all_season_pts", [])
+    season_tot_pts = round(sum(all_pts), 1) if all_pts else 0.0
     if all_pts:
         floor_pts = round(float(np.percentile(all_pts, 25)), 1)
         bust_games = sum(1 for pt in all_pts if pt < 7.0)
@@ -855,8 +882,6 @@ def build_player_profile(
 
     drop_info = recently_dropped_pids.get(str(pid))
     chopped_tag = f"🥩 Chopped Wk {drop_info['week']}" if drop_info else "Standard FA"
-
-    # Combined compact game environment string to prevent table clutter
     env_summary = "🛑 BYE" if is_on_bye else f"{opp_str} (Imp: {vegas_imp} | DvP {dvp_str})"
 
     return {
@@ -865,6 +890,10 @@ def build_player_profile(
         "Pos": pos,
         "Team": team,
         "Age": age if age > 0 else None,
+        "Depth_Chart": depth_str,
+        "Depth_Order": depth_order,
+        "Exp": f"{years_exp} yr" if years_exp > 0 else "Rookie",
+        "College": college,
         "Status": status_str,
         "Raw_Injury": raw_inj,
         "Body_Part": body_part,
@@ -876,6 +905,9 @@ def build_player_profile(
         "Game_Env": env_summary,
         "Game_State": live_game_state,
         "Wk_Pts": round(float(live_pts), 2),
+        "Season_Pts": season_tot_pts,
+        "Sleeper_Rank": sleeper_rk_str,
+        "Sleeper_Rank_Num": sleeper_rk_num,
         "Vegas_Implied": vegas_imp,
         "DvP_Matchup": dvp_str,
         "DvP_Rank": dvp_rk,
@@ -906,10 +938,11 @@ def build_player_profile(
         "Chopped_Status": chopped_tag,
         "24h_Adds": trend_adds,
     }
-
+# === END OF PART 1 ===
+# === START OF PART 2 ===
 
 # ==============================================================================
-# SIDEBAR CONTROLS & LIFECYCLE ENGINE
+# SIDEBAR CONTROLS, LIFECYCLE ENGINE & GLOBAL GLOSSARY
 # ==============================================================================
 if "sync_token" not in st.session_state:
     st.session_state.sync_token = 0
@@ -930,6 +963,7 @@ else:
 
 with st.sidebar:
     st.title("🏈 Fantasy Command Center")
+    st.caption(f"Build: `{APP_VERSION}`")
     selected_preset = st.radio(
         "📁 Select Active League",
         list(LEAGUE_PRESETS.keys()),
@@ -978,13 +1012,31 @@ with st.sidebar:
         "🤖 Primary AI Model (Auto-Cascades)",
         AI_MODEL_CASCADE,
         index=0,
-        help="Starts with the highest model and automatically cascades down if free-tier rate limits are reached.",
+        help="Automatically verifies active models on your API key and cascades down if rate-limited.",
     )
 
     if st.button("⚡ Force Live Sync / Refresh", use_container_width=True):
         st.session_state.sync_token += 1
         fetch_live_sleeper_league.clear()
+        fetch_reference_data.clear()
         st.rerun()
+
+    with st.expander("📖 Quick Glossary & Acronym Legend", expanded=False):
+        st.markdown(
+            """
+            * **Sleeper_Rank:** Current-season positional rank & PPG based on **this league's exact scoring rules**.
+            * **Pos_Rank / Dynasty_Val:** Multi-year Dynasty market rank & trade value (0–10,000 scale).
+            * **xFP/G:** Expected Fantasy Points per game from raw usage (targets, air yards, carries, red-zone opportunities).
+            * **FPOE:** Fantasy Points Over Expected (`Actual PPG - xFP/G`). Negative = Buy-Low (unlucky on TDs); Positive = Sell-High (TD outlier).
+            * **Vol / Floor Score (0–100):** Weekly safety & workload rating combining snap %, xFP/G, 25th-percentile floor, and matchup.
+            * **WOPR:** Weighted Opportunity Rating (`1.5 × Target Share + 0.7 × Air Yards Share`).
+            * **PACR:** Receiver efficiency converting air yards into actual receiving yards.
+            * **NGS_Sep:** Next Gen Stats average yards of separation from the nearest defender.
+            * **DvP:** Defense vs. Position (#1 = Toughest NFL defense, #32 = Easiest matchup).
+            * **PMR:** Players Remaining to play or currently in-play this week.
+            * **Max PF:** Optimal season points if you started your best lineup every week (determines inverse rookie draft order).
+            """
+        )
 
 # ==============================================================================
 # FETCH LIVE SLEEPER LEAGUE STATE & REFERENCE DATA
@@ -1006,6 +1058,8 @@ with st.spinner(f"Syncing live Sleeper rosters & Week {selected_week} data..."):
         rank_map,
         pos_rank_map,
         pos_rank_num_map,
+        sleeper_season_rank_map,
+        sleeper_season_rank_num,
         schedule_map,
         bye_teams_target_wk,
         nflverse_injuries,
@@ -1081,14 +1135,6 @@ total_faab_budget = int(league_settings.get("waiver_budget", 1000 if active_mode
 max_ir_slots = int(league_settings.get("reserve_slots", 0) or 0)
 waiver_day_num = int(league_settings.get("waiver_day_of_week", 2) or 2)
 waiver_day_str = WAIVER_DAY_MAP.get(waiver_day_num, "Wednesday")
-waiver_clear_days = int(league_settings.get("waiver_clear_days", 2) or 2)
-disable_trades_flag = int(league_settings.get("disable_trades", 0) or 0)
-trade_deadline_wk = int(league_settings.get("trade_deadline", 99) or 99)
-trades_allowed_str = (
-    "🚫 Trades Disabled"
-    if (disable_trades_flag == 1 or trade_deadline_wk == 0 or active_mode == "CHOP")
-    else f"✅ Trades Open (Deadline: Wk {trade_deadline_wk})"
-)
 
 allowed_ir_tags = {"IR", "PUP", "PUP-R", "NFI", "NFI-R"}
 if int(league_settings.get("reserve_allow_out", 0) or 0) == 1:
@@ -1220,8 +1266,9 @@ def build_df_from_pids(pid_list, rid_context=None):
         res.append(
             build_player_profile(
                 p, selected_week, players_db, val_map, rank_map, pos_rank_map, pos_rank_num_map,
-                schedule_map, bye_teams_target_wk, nflverse_injuries, dvp_ranks, weekly_usage,
-                nflverse_metrics, ngs_sep_map, trending_map, recently_dropped_pids, live_pts=live_score
+                sleeper_season_rank_map, sleeper_season_rank_num, schedule_map, bye_teams_target_wk,
+                nflverse_injuries, dvp_ranks, weekly_usage, nflverse_metrics, ngs_sep_map,
+                trending_map, recently_dropped_pids, live_pts=live_score
             )
         )
     return pd.DataFrame(res)
@@ -1238,8 +1285,9 @@ for pid, p in players_db.items():
     if str(pid) not in rostered_pids and p.get("position") in ["QB", "RB", "WR", "TE"] and p.get("team"):
         prof = build_player_profile(
             pid, selected_week, players_db, val_map, rank_map, pos_rank_map, pos_rank_num_map,
-            schedule_map, bye_teams_target_wk, nflverse_injuries, dvp_ranks, weekly_usage,
-            nflverse_metrics, ngs_sep_map, trending_map, recently_dropped_pids
+            sleeper_season_rank_map, sleeper_season_rank_num, schedule_map, bye_teams_target_wk,
+            nflverse_injuries, dvp_ranks, weekly_usage, nflverse_metrics, ngs_sep_map,
+            trending_map, recently_dropped_pids
         )
         if (
             prof["Volume_Score"] >= 10.0
@@ -1366,7 +1414,6 @@ def predict_smart_faab_for_player(wr_row, spendable_faab, max_rival_faab, avg_su
     return threats_summary, smart_tag, lock_tag, f"${val_bid}"
 
 
-# Pre-compute Max PF Draft Order & Future Pick Inventory (2027-2029)
 sorted_by_max_pf = sorted(all_gm_rosters.items(), key=lambda x: (x[1]["max_pf"], x[1]["wins"]))
 rid_to_proj_slot = {}
 for slot_idx, (orig_gm, rdata) in enumerate(sorted_by_max_pf, 1):
@@ -1505,7 +1552,7 @@ def build_league_positional_scout(all_gm_rosters, players_db, val_map, pos_rank_
 df_league_pos_scout = build_league_positional_scout(all_gm_rosters, players_db, val_map, pos_rank_num_map)
 
 # ==============================================================================
-# AUTOMATED ALERTS & PRACTICE PREVENTION ENGINE
+# AUTOMATED ALERTS, PRACTICE PIVOTS & FLEX-AWARE (RB/WR/TE) UPGRADE ENGINE
 # ==============================================================================
 lineup_alerts = []
 ir_alerts = []
@@ -1544,12 +1591,19 @@ if not my_full_roster_df.empty:
             is_starter = r_row["PID"] in my_starters_pids
             role_tag = "🏆 STARTER" if is_starter else "🪑 Bench / IR"
 
-            pos_bench = healthy_bench[healthy_bench["Pos"] == pos] if not healthy_bench.empty else pd.DataFrame()
+            # Check both direct positional bench pivots AND Flex (RB/WR/TE) bench pivots
+            if pos in ["RB", "WR", "TE"] and not healthy_bench.empty:
+                pos_bench = healthy_bench[healthy_bench["Pos"].isin(["RB", "WR", "TE"])]
+            elif not healthy_bench.empty:
+                pos_bench = healthy_bench[healthy_bench["Pos"] == pos]
+            else:
+                pos_bench = pd.DataFrame()
+
             if not pos_bench.empty:
                 best_b = pos_bench.sort_values("Chop_Floor_Score" if active_mode == "CHOP" else "Volume_Score", ascending=False).iloc[0]
-                bench_pivot = f"{best_b['Player']} ({best_b['Matchup']} | {best_b['xFP/G']} xFP/G)"
+                bench_pivot = f"{best_b['Player']} ({best_b['Pos']} | {best_b['Matchup']} | {best_b['xFP/G']} xFP/G)"
             else:
-                bench_pivot = "⚠️ No Healthy Bench Pivot at Pos!"
+                bench_pivot = "⚠️ No Healthy Bench Pivot!"
 
             if not df_waivers.empty:
                 w_pos = df_waivers[(df_waivers["Pos"] == pos) & (~df_waivers["Is_Bye"]) & (df_waivers["Practice_Risk"] == "HEALTHY")]
@@ -1575,27 +1629,131 @@ if not my_full_roster_df.empty:
                 "Injury_Status": r_row["Status"],
                 "Practice_Report": r_row["Practice"],
                 "Pre_Sunday_Action": action_rec,
-                "Best_Healthy_Bench_Pivot": bench_pivot,
+                "Best_Bench_or_Flex_Pivot": bench_pivot,
                 "Top_Waiver_Insurance": waiver_pivot,
                 "Notes": r_row["Injury_Notes"] or r_row["Body_Part"] or "-",
             })
 
+# Start/Sit Upgrade Engine (Checks direct position AND cross-position RB/WR/TE FLEX upgrades)
 if not my_starters_df.empty and not my_bench_df.empty:
     eligible_bench = my_bench_df[
         (~my_bench_df["Is_Bye"]) & (~my_bench_df["Raw_Injury"].isin(["Out", "Doubtful", "IR", "PUP", "NA", "Sus"]))
     ]
     metric_key = "Chop_Floor_Score" if active_mode == "CHOP" else "Volume_Score"
+    seen_swaps = set()
+
+    # 1. Direct Positional Checks
     for pos in ["QB", "RB", "WR", "TE"]:
         st_pos = my_starters_df[my_starters_df["Pos"] == pos]
         bn_pos = eligible_bench[eligible_bench["Pos"] == pos]
         for _, s_r in st_pos.iterrows():
             for _, b_r in bn_pos.iterrows():
-                if s_r["Is_Bye"] or (
-                    b_r[metric_key] >= s_r[metric_key] + 7.5 and b_r["xFP/G"] >= s_r["xFP/G"]
-                ):
-                    volume_swap_alerts.append(
-                        f"⚡ **Start/Sit Upgrade ({pos}):** Start Bench **{b_r['Player']}** ({b_r['Matchup']}, {b_r['xFP/G']} xFP/G, {b_r['Bust_Rate_%']}% Bust Rate) over **{s_r['Player']}** ({s_r['xFP/G']} xFP/G, {s_r['Bust_Rate_%']}% Bust Rate)."
-                    )
+                if s_r["Is_Bye"] or (b_r[metric_key] >= s_r[metric_key] + 7.5 and b_r["xFP/G"] >= s_r["xFP/G"]):
+                    swap_k = (s_r["PID"], b_r["PID"])
+                    if swap_k not in seen_swaps:
+                        seen_swaps.add(swap_k)
+                        volume_swap_alerts.append(
+                            f"⚡ **Start/Sit Upgrade ({pos}):** Start Bench **{b_r['Player']} ({b_r['Pos']})** ({b_r['Matchup']}, {b_r['xFP/G']} xFP/G, {b_r['Sleeper_Rank']}) over **{s_r['Player']} ({s_r['Pos']})** ({s_r['xFP/G']} xFP/G, {s_r['Sleeper_Rank']})."
+                        )
+
+    # 2. Cross-Positional FLEX Checks (RB / WR / TE eligible in FLEX spots)
+    min_pos_req = {"RB": roster_positions.count("RB"), "WR": roster_positions.count("WR"), "TE": roster_positions.count("TE")}
+    st_flex_pool = my_starters_df[my_starters_df["Pos"].isin(["RB", "WR", "TE"])]
+    bn_flex_pool = eligible_bench[eligible_bench["Pos"].isin(["RB", "WR", "TE"])]
+    st_pos_counts = st_flex_pool["Pos"].value_counts().to_dict()
+
+    for _, s_r in st_flex_pool.iterrows():
+        s_pos = s_r["Pos"]
+        # Only swap out a starter for a different position if starter count at s_pos exceeds minimum dedicated slots
+        if st_pos_counts.get(s_pos, 0) > min_pos_req.get(s_pos, 1):
+            for _, b_r in bn_flex_pool.iterrows():
+                if b_r["Pos"] != s_pos:
+                    if s_r["Is_Bye"] or (b_r[metric_key] >= s_r[metric_key] + 8.5 and b_r["xFP/G"] >= s_r["xFP/G"] + 1.0):
+                        swap_k = (s_r["PID"], b_r["PID"])
+                        if swap_k not in seen_swaps:
+                            seen_swaps.add(swap_k)
+                            volume_swap_alerts.append(
+                                f"🔄 **FLEX Cross-Position Upgrade ({b_r['Pos']} over {s_pos}):** Start Bench **{b_r['Player']} ({b_r['Pos']})** ({b_r['Matchup']}, {b_r['xFP/G']} xFP/G, {b_r['Sleeper_Rank']}) in your FLEX over **{s_r['Player']} ({s_pos})** ({s_r['xFP/G']} xFP/G)."
+                            )
+
+# ==============================================================================
+# INTERACTIVE SLEEPER-STYLE PLAYER PROFILE DRAWER / INSPECTOR
+# ==============================================================================
+def render_player_profile_inspector(df_pool, section_key, title_label="🔍 Interactive Player Profile, Game Log & Depth Chart Inspector"):
+    if df_pool is None or df_pool.empty:
+        return
+    with st.expander(title_label, expanded=False):
+        player_options = [
+            f"{r['Player']} ({r['Pos']} - {r['Team']} | Sleeper: {r['Sleeper_Rank']} | Dynasty: {r['Pos_Rank']})"
+            for _, r in df_pool.iterrows()
+        ]
+        sel_label = st.selectbox("Select a Player to Inspect Full Profile:", player_options, key=f"insp_{section_key}")
+        sel_idx = player_options.index(sel_label)
+        p_row = df_pool.iloc[sel_idx]
+        pid_str = str(p_row["PID"])
+        p_team = p_row["Team"]
+        p_pos = p_row["Pos"]
+
+        # Header Bio & Dual Rank Cards
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Sleeper Season Rank", p_row["Sleeper_Rank"], delta=f"{p_row['Season_Pts']} Tot Pts")
+        m2.metric("Dynasty Market Rank", p_row["Pos_Rank"], delta=f"Val: {p_row['Dynasty_Val']:,}")
+        m3.metric("NFL Depth Chart", p_row["Depth_Chart"], delta=f"{p_row['Snap_%']}% Snaps")
+        m4.metric("Usage (xFP/G vs PPG)", f"{p_row['xFP/G']} xFP", delta=f"{p_row['Recent_PPG']} PPG ({p_row['FPOE']:+.1f} FPOE)")
+        m5.metric("Health & Practice", p_row["Practice"], delta=p_row["Status"])
+        m6.metric("Age / Experience", f"{p_row['Age'] or '-'} yo", delta=f"{p_row['Exp']} ({p_row['College']})")
+
+        col_log, col_dc = st.columns([1.45, 1])
+        with col_log:
+            st.markdown(f"**📅 {curr_season} Week-by-Week Game Log ({p_row['Player']})**")
+            g_logs = weekly_usage.get(pid_str, {}).get("game_log", [])
+            if g_logs:
+                st.dataframe(pd.DataFrame(g_logs), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No completed regular-season game logs recorded yet.")
+
+        with col_dc:
+            st.markdown(f"**🏛️ {p_team} `{p_pos}` Depth Chart & Usage Share**")
+            dc_peers = []
+            for k_pid, k_meta in players_db.items():
+                if norm_nfl_team(k_meta.get("team")) == p_team and k_meta.get("position") == p_pos:
+                    d_ord = int(k_meta.get("depth_chart_order") or 99)
+                    u_peer = weekly_usage.get(str(k_pid), {})
+                    snaps_p = round(float(np.mean(u_peer.get("snap_pcts", [0.0]))), 1) if u_peer.get("snap_pcts") else 0.0
+                    xfp_p = round(float(np.mean(u_peer.get("xfp", [0.0]))), 1) if u_peer.get("xfp") else 0.0
+                    if d_ord <= 4 or snaps_p > 5.0 or str(k_pid) == pid_str:
+                        p_nm = f"{k_meta.get('first_name', '')} {k_meta.get('last_name', '')}".strip()
+                        dc_peers.append({
+                            "Depth": f"#{d_ord}" if d_ord < 99 else "Rot",
+                            "Order_Num": d_ord,
+                            "Player": f"👉 {p_nm}" if str(k_pid) == pid_str else p_nm,
+                            "Status": k_meta.get("injury_status") or "Healthy",
+                            "Snap_%": f"{snaps_p}%",
+                            "xFP/G": xfp_p,
+                        })
+            if dc_peers:
+                df_dc = pd.DataFrame(dc_peers).sort_values(by=["Order_Num", "xFP/G"], ascending=[True, False])
+                st.dataframe(df_dc[["Depth", "Player", "Status", "Snap_%", "xFP/G"]], use_container_width=True, hide_index=True)
+
+            st.markdown(f"**🗓️ Upcoming 4-Week Schedule ({p_team})**")
+            sched_rows = []
+            for w_f in range(selected_week, min(19, selected_week + 4)):
+                sc_f = schedule_map.get((w_f, p_team))
+                if not sc_f:
+                    sched_rows.append({"Week": f"Wk {w_f}", "Matchup": "🛑 BYE", "Implied_Pts": "-", "DvP_Rank": "BYE"})
+                else:
+                    opp_f = sc_f["opp"]
+                    pref = "vs" if sc_f["is_home"] else "@"
+                    dvp_f = dvp_ranks.get((opp_f, p_pos), 16)
+                    tier_f = "🟢 Easy" if dvp_f >= 22 else ("🔴 Tough" if dvp_f <= 10 else "🟡 Neutral")
+                    sched_rows.append({
+                        "Week": f"Wk {w_f}",
+                        "Matchup": f"{pref} {opp_f}",
+                        "Implied_Pts": sc_f["implied"],
+                        "DvP_Rank": f"#{dvp_f} ({tier_f})",
+                    })
+            st.dataframe(pd.DataFrame(sched_rows), use_container_width=True, hide_index=True)
+
 
 # ==============================================================================
 # MODE-SPECIFIC METRICS & OPPONENT / CUT-LINE CONTEXT
@@ -1605,7 +1763,6 @@ tep_val = float(scoring_settings.get("bonus_rec_te", 0.0) or 0.0)
 ppr_val = float(scoring_settings.get("rec", 1.0) or 1.0)
 
 opp_gm_name = "Bye / TBD"
-opp_starters_df = pd.DataFrame()
 if my_roster_id and matchups:
     my_m = next((m for m in matchups if m.get("roster_id") == my_roster_id), None)
     if my_m and my_m.get("matchup_id"):
@@ -1616,9 +1773,6 @@ if my_roster_id and matchups:
         if opp_m:
             opp_rid = int(opp_m.get("roster_id"))
             opp_gm_name = rid_to_gm.get(opp_rid, f"Roster {opp_rid}")
-            opp_starters_df = build_df_from_pids(
-                [str(x) for x in (opp_m.get("starters") or []) if x and str(x) != "0"], opp_rid
-            )
 
 surviving_teams = [(gm, d) for gm, d in all_gm_rosters.items() if d["is_alive"]]
 chopped_teams = [(gm, d) for gm, d in all_gm_rosters.items() if not d["is_alive"]]
@@ -1661,10 +1815,9 @@ with top_col1:
     )
 
 with top_col2:
-    # Persistent Floating AI Copilot Popover (Accessible from ANY Hub!)
     with st.popover("💬 Open AI War Room Copilot", use_container_width=True):
         st.markdown(f"### 🤖 {active_mode.title()} AI Copilot (Wk {selected_week})")
-        st.caption("Automatically cascades from `gemini-3.1-pro-preview` down to Flash models if rate-limited.")
+        st.caption("Auto-discovers active models on your API key & cascades on rate limits.")
 
         chat_state_key = f"copilot_msgs_{league_id_input}_{selected_week}"
         if chat_state_key not in st.session_state:
@@ -1673,7 +1826,7 @@ with top_col2:
                     "role": "assistant",
                     "content": (
                         f"Synced with **{gm_input}** for **Week {selected_week}** ({active_mode} Mode).\n"
-                        "Use a quick button below or ask any question while browsing the hubs!"
+                        "FLEX spots explicitly evaluate **RB, WR, and TE** cross-positional upgrades!"
                     ),
                 }
             ]
@@ -1683,7 +1836,7 @@ with top_col2:
         if qa1.button("⚡ Audit Wk Lineup", key="cp_q1", use_container_width=True):
             copilot_quick = (
                 f"Audit my Week {selected_week} starting lineup vs my Active Bench (excluding Bye teams {bye_teams_target_wk} and Taxi). "
-                "Recommend exact start/sit swaps using xFP/G, Snap %, Practice status, and Floor/Volume Score."
+                "Remember FLEX slots accept RB, WR, and TE! Recommend exact start/sit swaps using Sleeper_Rank, xFP/G, Snap %, Practice status, and Floor/Volume Score."
             )
         if qa2.button("📡 Top Waiver Claims", key="cp_q2", use_container_width=True):
             copilot_quick = (
@@ -1693,7 +1846,7 @@ with top_col2:
 
         qa3, qa4 = st.columns(2)
         if qa3.button("🏥 Practice Pivots", key="cp_q3", use_container_width=True):
-            copilot_quick = "Check my roster's Practice & Injury alerts (DNP/LP). Who is at risk for Sunday and who is my best pivot?"
+            copilot_quick = "Check my roster's Practice & Injury alerts (DNP/LP). Who is at risk for Sunday and who is my best RB/WR/TE pivot?"
         if qa4.button("🤝 Trade / Strategy", key="cp_q4", use_container_width=True):
             if active_mode == "DYNASTY":
                 active_trade_ctx = st.session_state.get("active_trade_context", "No trade currently selected in Hub 3.")
@@ -1721,16 +1874,15 @@ with top_col2:
                     active_trade_ctx = st.session_state.get("active_trade_context", "None")
                     copilot_sys = f"""
                     You are an elite NFL Fantasy Football Data Scientist and GM Advisor for Carlos ('{gm_input}') in League {league_id_input} ({active_mode} Mode).
-                    Respond strictly in English. Be concise, sharp, and cite exact numbers (xFP/G, Snap %, Floor/Volume Score, Dynasty Val, FAAB).
-                    Current Context: {curr_season} Season, Week {selected_week}. Phase: {lifecycle_banner}.
+                    Respond strictly in English. Cite exact numbers (Sleeper_Rank, Pos_Rank, xFP/G, Snap %, Floor/Volume Score, Dynasty Val, FAAB).
+                    Current Context: {curr_season} Season, Week {selected_week}. Roster Slots: {roster_positions}.
                     NFL Teams on BYE in Week {selected_week}: {bye_teams_target_wk}.
-                    Allowed IR Designations: {sorted(list(allowed_ir_tags))}.
                     Total FAAB: ${my_faab_rem} | Spendable FAAB (after ${endgame_faab_reserve} Endgame Reserve): ${my_spendable_faab}.
 
                     CRITICAL RULES:
                     1. NEVER recommend starting any player on BYE ({bye_teams_target_wk}) or Out/IR.
-                    2. NEVER recommend starting Taxi Squad players without noting they must be promoted.
-                    3. In CHOP mode, never recommend bids exceeding ${my_spendable_faab} (protect the ${endgame_faab_reserve} endgame reserve).
+                    2. FLEX slots ('FLEX') can be filled by RB, WR, or TE! Always compare top bench RBs, WRs, and TEs against the weakest FLEX starter regardless of position.
+                    3. NEVER recommend starting Taxi Squad players without noting they must be promoted.
 
                     LIVE DATA:
                     - Starters: {my_starters_df.to_dict(orient='records') if not my_starters_df.empty else []}
@@ -1754,13 +1906,13 @@ with top_col2:
                     except Exception as e:
                         st.error(f"API Error: {e}")
 
-# Top KPI Strip (Mode-Adaptive)
+# Top KPI Strip
 if active_mode == "CHOP":
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Teams Alive", f"{len(surviving_teams)} / {len(all_gm_rosters)}", delta=f"{len(chopped_teams)} Chopped")
     k2.metric(f"Cut Line ({cut_line_gm})", f"{cut_line_score:.2f} pts", delta=f"{cut_pmr} PMR")
     k3.metric("Your Safety Buffer", f"{safety_buffer:+.2f} pts", delta=f"{my_pmr} PMR")
-    k4.metric("Spendable FAAB Now", f"${my_spendable_faab}", delta=f"${endgame_faab_reserve} Reserved (Total: ${my_faab_rem})")
+    k4.metric("Spendable FAAB Now", f"${my_spendable_faab}", delta=f"${endgame_faab_reserve} Reserved (Tot: ${my_faab_rem})")
     k5.metric("Action Alerts", len(lineup_alerts) + len(volume_swap_alerts))
 else:
     my_score_w = all_gm_rosters.get(gm_input, {}).get("curr_wk_pts", 0.0)
@@ -1775,20 +1927,22 @@ else:
     k4.metric("Practice / Lineup Alerts", len(lineup_alerts) + len(volume_swap_alerts))
     k5.metric("Coaching Efficiency", f"{my_eff}%")
 
-# Shared Column Configuration for Clean Visual Progress Bars
 SHARED_COL_CFG = {
     "Snap_%": st.column_config.ProgressColumn("Snap %", format="%.1f%%", min_value=0, max_value=100),
     "Volume_Score": st.column_config.ProgressColumn("Vol Score", format="%.1f", min_value=0, max_value=100),
     "Chop_Floor_Score": st.column_config.ProgressColumn("Floor Score", format="%.1f", min_value=0, max_value=100),
     "Contingency_Score": st.column_config.ProgressColumn("Contingency", format="%.1f", min_value=0, max_value=100),
+    "Sleeper_Rank": st.column_config.TextColumn("Sleeper Season Rank", help="Actual current-season positional rank & PPG in this league's scoring"),
+    "Pos_Rank": st.column_config.TextColumn("Dynasty Pos Rank", help="Multi-year Dynasty market positional rank"),
+    "Depth_Chart": st.column_config.TextColumn("Depth Chart", help="NFL team depth chart order"),
     "Dynasty_Val": st.column_config.NumberColumn("Dynasty Val", format="%d"),
     "xFP/G": st.column_config.NumberColumn("xFP/G", format="%.1f"),
-    "Recent_PPG": st.column_config.NumberColumn("PPG", format="%.1f"),
+    "Recent_PPG": st.column_config.NumberColumn("Lookback PPG", format="%.1f"),
     "Wk_Pts": st.column_config.NumberColumn("Wk Pts", format="%.2f"),
 }
 
 # ==============================================================================
-# THE 4 UNIFIED WORKFLOW HUBS (SHARED STRUCTURE FOR BOTH LEAGUES)
+# THE 4 UNIFIED WORKFLOW HUBS
 # ==============================================================================
 hub1, hub2, hub3, hub4 = st.tabs([
     "⚡ 1. Weekly Gameplan & Lineup",
@@ -1801,9 +1955,21 @@ hub1, hub2, hub3, hub4 = st.tabs([
 # HUB 1: WEEKLY GAMEPLAN, INTEGRATED PRACTICE PIVOTS & LINEUP CENTER
 # ------------------------------------------------------------------------------
 with hub1:
-    # 1A. Actionable Alerts & Integrated Pre-Sunday Practice Pivots
+    with st.expander("❓ Hub 1 Glossary: Lineup, Dual Rankings & Game Environment Metrics", expanded=False):
+        st.markdown(
+            """
+            * **`Sleeper Season Rank` vs. `Dynasty Pos Rank`:**
+              * **`Sleeper Season Rank`** (e.g., `RB8 (16.4 PPG)`) ranks players strictly by **actual fantasy points scored this season** under your league's exact scoring rules. Use this for **weekly Start/Sit decisions**.
+              * **`Dynasty Pos Rank`** (e.g., `RB14`) ranks players by **long-term multi-year trade value** (factoring in age and contract longevity).
+            * **`Depth Chart`:** Official NFL team depth chart order (`#1 WR`, `#2 RB`, etc.).
+            * **`Vol Score` / `Floor Score` (0–100):** Weekly composite rating combining `Snap %`, `xFP/G`, 25th-percentile scoring floor, practice status, and Vegas/DvP matchup.
+            * **`xFP/G` (Expected Fantasy Points):** Points a player *should* average based on raw usage (targets, air yards, carries, red-zone touches) independent of TD luck.
+            * **`Game_Env`:** Shows Opponent, **Vegas Implied Team Total (`Imp`)** (24+ pts = elite scoring environment), and **Defense vs. Position (`DvP`)** (#1 = toughest defense, #32 = easiest defense).
+            """
+        )
+
     if lineup_alerts or ir_alerts or volume_swap_alerts:
-        st.markdown("#### 🚨 Immediate Lineup & Pre-Sunday Action Items")
+        st.markdown("#### 🚨 Immediate Lineup & Pre-Sunday Action Items (Includes Cross-Positional RB/WR/TE FLEX Checks)")
         for al in lineup_alerts:
             st.error(al)
         for sw in volume_swap_alerts:
@@ -1811,13 +1977,12 @@ with hub1:
         for ir_a in ir_alerts:
             st.info(ir_a)
     else:
-        st.success(f"✅ Week {selected_week} Lineup Optimized: All starters are active, practicing, and carry your highest volume/floor scores!")
+        st.success(f"✅ Week {selected_week} Lineup Optimized: All starters and FLEX spots carry your highest volume/floor scores!")
 
     if practice_prevention_rows:
         with st.expander(f"🏥 Pre-Sunday Practice Report & Injury Pivot Plan ({len(practice_prevention_rows)} Flagged Players)", expanded=True):
             st.dataframe(pd.DataFrame(practice_prevention_rows), use_container_width=True, hide_index=True)
 
-    # 1B. Live Scoreboard / Guillotine Cut-Line Summary
     if active_mode == "CHOP":
         with st.expander("🪓 Live 18-Team Guillotine Cut-Line Standings & PMR", expanded=False):
             board_rows = []
@@ -1841,19 +2006,26 @@ with hub1:
                 })
             st.dataframe(pd.DataFrame(board_rows), use_container_width=True, hide_index=True)
 
-    # 1C. Decluttered Start/Sit Comparator with Optional Deep Metrics Toggle
+    # Interactive Player Profile Inspector for Your Roster
+    render_player_profile_inspector(
+        my_full_roster_df,
+        "hub1_roster",
+        "🔍 Click to Open Player Profile, Week-by-Week Game Log & NFL Depth Chart (Your Roster)",
+    )
+
     col_hdr, col_tog = st.columns([3, 1])
     col_hdr.markdown(f"#### 🏆 Week {selected_week} Starting Lineup vs. Active Bench")
     show_deep_cols = col_tog.checkbox("🔬 Show Deep Metrics (WOPR, PACR, NGS, FPOE)", value=False)
 
     primary_score_col = "Chop_Floor_Score" if active_mode == "CHOP" else "Volume_Score"
     base_cols = [
-        "Player", "Pos", "Pos_Rank", "Team", "Status", "Practice",
-        "Game_Env", "Game_State", "Wk_Pts", primary_score_col, "xFP/G", "Recent_PPG", "Snap_%"
+        "Player", "Pos", "Sleeper_Rank", "Pos_Rank", "Depth_Chart", "Team",
+        "Status", "Practice", "Game_Env", "Game_State", "Wk_Pts",
+        primary_score_col, "xFP/G", "Recent_PPG", "Snap_%"
     ]
     if active_mode == "CHOP":
-        base_cols.insert(10, "Bust_Rate_%")
-        base_cols.insert(11, "Floor_25th_Pts")
+        base_cols.insert(12, "Bust_Rate_%")
+        base_cols.insert(13, "Floor_25th_Pts")
     else:
         base_cols.append("Dynasty_Val")
 
@@ -1861,14 +2033,9 @@ with hub1:
     active_table_cols = base_cols + (deep_extra_cols if show_deep_cols else [])
 
     if not my_starters_df.empty:
-        st.dataframe(
-            my_starters_df[active_table_cols],
-            column_config=SHARED_COL_CFG,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(my_starters_df[active_table_cols], column_config=SHARED_COL_CFG, use_container_width=True, hide_index=True)
 
-    st.markdown(f"#### 🪑 Active Bench (Sorted by {primary_score_col.replace('_', ' ')})")
+    st.markdown(f"#### 🪑 Active Bench (Sorted by {primary_score_col.replace('_', ' ')} — Check RB/WR/TE for FLEX)")
     if not my_bench_df.empty:
         st.dataframe(
             my_bench_df.sort_values(by=["Is_Bye", primary_score_col], ascending=[True, False])[active_table_cols],
@@ -1898,9 +2065,20 @@ with hub1:
 # ------------------------------------------------------------------------------
 with hub2:
     st.subheader("📡 Unrostered Waiver Wire Radar & FAAB Bid Intelligence")
+    with st.expander("❓ Hub 2 Glossary: Waiver Metrics, Contingency Score & Smart FAAB Tiers", expanded=False):
+        st.markdown(
+            """
+            * **`Contingency Score` (0–100):** Evaluates backup RBs based on offensive implied points, depth chart #2 status, snap share, and youth. A 65+ score flags an elite "1-injury-away" league-winner handcuff.
+            * **`24h_Adds`:** Live count of how many Sleeper leagues added this player in the last 24 hours.
+            * **`Endgame FAAB Reserve` (Chop Mode):** Locks away `$50` (configurable in sidebar) for Weeks 12–17 so you can win elite chopped stars for `$1–$2` once rivals hit `$0`.
+            * **`💡 Optimal Bid`:** Calculated to beat the highest-threat needy rival's estimated bid by an odd psychological increment (`+$3` or `+$7` to avoid `$5/$10` ties).
+            * **`🔒 Lock-In Bid`:** `$1` more than the needy rival's entire remaining FAAB stack (guarantees victory).
+            """
+        )
+
     if active_mode == "CHOP":
         st.info(
-            f"🛡️ **Endgame FAAB Protocol:** Total FAAB: **`${my_faab_rem}`** | Locked Reserve: **`${endgame_faab_reserve}`** (for late-season $1 sweeps) | **Max Spendable Now: `${my_spendable_faab}`** | Max Rival: `${max_rival_faab}`"
+            f"🛡️ **Endgame FAAB Protocol:** Total FAAB: **`${my_faab_rem}`** | Locked Reserve: **`${endgame_faab_reserve}`** | **Max Spendable Now: `${my_spendable_faab}`** | Max Rival: `${max_rival_faab}`"
         )
     else:
         avg_rem_faab = int(np.mean([d["faab_rem"] for d in all_gm_rosters.values()])) if all_gm_rosters else 0
@@ -1949,22 +2127,27 @@ with hub2:
                 vw = vw.sort_values(by=w_sort_sel, ascending=False)
 
             w_display_cols = [
-                "Player", "Pos", "Pos_Rank", "Team", "Chopped_Status", "Status", "Game_Env",
-                "Chop_Floor_Score", "xFP/G", "Recent_PPG", "Bust_Rate_%", "Snap_%",
+                "Player", "Pos", "Sleeper_Rank", "Pos_Rank", "Depth_Chart", "Team", "Chopped_Status",
+                "Status", "Game_Env", "Chop_Floor_Score", "xFP/G", "Recent_PPG", "Bust_Rate_%", "Snap_%",
                 "🎯 Rival Threats & Est. Bid", "💡 Optimal Bid", "🔒 Lock-In Bid", "💰 Value Bid"
             ]
         else:
             if not vw.empty and waiver_preset_mode != "🔒 RB Contingency Handcuffs":
                 vw = vw.sort_values(by=w_sort_sel, ascending=False)
             w_display_cols = [
-                "Player", "Pos", "Pos_Rank", "Team", "Age", "Status", "Practice", "Game_Env",
-                "Volume_Score", "xFP/G", "Recent_PPG", "Contingency_Score", "Snap_%", "24h_Adds", "Dynasty_Val"
+                "Player", "Pos", "Sleeper_Rank", "Pos_Rank", "Depth_Chart", "Team", "Age",
+                "Status", "Practice", "Game_Env", "Volume_Score", "xFP/G", "Recent_PPG",
+                "Contingency_Score", "Snap_%", "24h_Adds", "Dynasty_Val"
             ]
 
+        render_player_profile_inspector(
+            vw.head(35),
+            "hub2_waivers",
+            "🔍 Click to Inspect Waiver Target Profile, Game Log & Team Depth Chart",
+        )
         st.dataframe(vw[w_display_cols].head(35), column_config=SHARED_COL_CFG, use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    # Integrated Auction Archive & Bidder Profiles on the Exact Same Screen
     col_arch, col_prof = st.columns([1.2, 1])
     with col_arch:
         st.markdown("#### 🕵️‍♂️ League FAAB Auction Archive (Winning & Losing Bids)")
@@ -2000,6 +2183,14 @@ with hub2:
 # ------------------------------------------------------------------------------
 with hub3:
     st.subheader("🤝 League Positional Power Matrix & Integrated Rival Scout / Trade Desk")
+    with st.expander("❓ Hub 3 Glossary: Positional Power Ranks, Tiers & Trade Valuation", expanded=False):
+        st.markdown(
+            """
+            * **`Positional Rank Unit` (`#1 (18,400 | 2/3 T12/24)`):** Shows a team's league rank at that position (`#1` = strongest in league), total Dynasty value at that position, and count of Top-12 / Top-24 studs (`T12/24`).
+            * **`Tier_Status`:** Classifies teams into **🏆 Contender** (winning record + above-median Max PF), **🔨 Rebuilder** (below-median record & Max PF), or **⚖️ Middle Tier**.
+            * **`Proj Slot` (Draft Picks):** Projects 2027 rookie pick slots (`1.01` to `1.12`) live using **Inverse Max PF** (lowest optimal points earns `1.01`).
+            """
+        )
 
     if not df_league_pos_scout.empty:
         with st.expander("📊 League-Wide Positional Power Matrix (#1 to #Last in QB, RB, WR, TE)", expanded=True):
@@ -2018,7 +2209,6 @@ with hub3:
         p_r_info = all_gm_rosters.get(partner_gm, {})
         p_rid = p_r_info.get("roster_id")
 
-        # Show Partner's Positional Ranks & Held Future Picks Immediately!
         p_scout_row = df_league_pos_scout[df_league_pos_scout["GM"] == partner_gm]
         p_tier_str = p_scout_row.iloc[0]["Tier_Status"] if not p_scout_row.empty else "Rival"
         p_picks_held = [pk["Short_Label"] for pk in gm_picks_inventory.get(partner_gm, []) if pk["Round"] in [1, 2]]
@@ -2034,14 +2224,20 @@ with hub3:
         if active_mode == "DYNASTY" and p_picks_held:
             st.caption(f"**🔮 {partner_gm}'s Key Future Picks (Rd 1–2):** `{' | '.join(p_picks_held[:6])}`")
 
-        # Expandable Full Roster Inspector right above the Trade Machine
-        with st.expander(f"👁️ Inspect `{partner_gm}`'s Full Roster & Live Positional Ranks (Starters, Bench, Taxi, IR)", expanded=(active_mode == "CHOP")):
+        p_full_df = build_df_from_pids(p_r_info.get("players", []), p_rid)
+        render_player_profile_inspector(
+            p_full_df,
+            "hub3_rival",
+            f"🔍 Click to Inspect Any Player on `{partner_gm}`'s Roster (Game Log & Depth Chart)",
+        )
+
+        with st.expander(f"👁️ Inspect `{partner_gm}`'s Full Roster Table (Dual Ranks: Sleeper Season vs. Dynasty)", expanded=(active_mode == "CHOP")):
             p_st_df = build_df_from_pids(p_r_info.get("starters", []), p_rid)
             p_bn_df = build_df_from_pids(p_r_info.get("bench", []), p_rid)
             p_tx_df = build_df_from_pids(p_r_info.get("taxi", []), p_rid)
             scout_view_cols = [
-                "Player", "Pos", "Pos_Rank", "Overall_Rank", "Team", "Age", "Status",
-                "Practice", "Game_Env", "Wk_Pts", "xFP/G", "Recent_PPG", "Snap_%", "Dynasty_Val"
+                "Player", "Pos", "Sleeper_Rank", "Pos_Rank", "Depth_Chart", "Team", "Age",
+                "Status", "Practice", "Game_Env", "Wk_Pts", "xFP/G", "Recent_PPG", "Snap_%", "Dynasty_Val"
             ]
             rc1, rc2 = st.columns(2)
             with rc1:
@@ -2056,7 +2252,6 @@ with hub3:
                     st.markdown(f"**🚕 {partner_gm}'s Taxi Squad**")
                     st.dataframe(p_tx_df.sort_values("Dynasty_Val", ascending=False)[scout_view_cols], column_config=SHARED_COL_CFG, use_container_width=True, hide_index=True)
 
-        # Dynasty Trade Machine (Only in Dynasty Mode)
         if active_mode == "DYNASTY":
             st.markdown("#### ⚖️ Positional Trade Machine & Persuasion Pitch Generator")
 
@@ -2070,7 +2265,7 @@ with hub3:
                     for _, row in df_p.iterrows():
                         pos = row["Pos"]
                         if pos in ["QB", "RB", "WR", "TE"]:
-                            lbl = f"{row['Player']} ({row['Pos_Rank']} | Val: {row['Dynasty_Val']:,} | {row['xFP/G']} xFP/G)"
+                            lbl = f"{row['Player']} (Sleeper: {row['Sleeper_Rank']} | Dyn: {row['Pos_Rank']} | Val: {row['Dynasty_Val']:,})"
                             by_pos[pos][lbl] = row.to_dict()
                 for pk in gm_picks_inventory.get(gm_u, []):
                     by_pos["PICK"][pk["Label"]] = pk
@@ -2120,7 +2315,6 @@ with hub3:
                 sent_names_clean = ", ".join([x.get("Player") or x.get("Short_Label") for x in sent_items]) or "None"
                 rec_names_clean = ", ".join([x.get("Player") or x.get("Short_Label") for x in rec_items]) or "None"
 
-                # Sync active trade to session_state so the Persistent AI Copilot can see it!
                 st.session_state["active_trade_context"] = (
                     f"Trade with {partner_gm}: {gm_input} sends [{sent_names_clean}] (Val: {send_val}, {send_xfp} xFP/G) "
                     f"and receives [{rec_names_clean}] (Val: {get_val}, {get_xfp} xFP/G)."
@@ -2189,7 +2383,7 @@ with hub3:
                         - {partner_gm} Receives: {sent_items} (Total Val: {send_val}, Total xFP/G: {send_xfp})
                         - {gm_input} Receives: {rec_items} (Total Val: {get_val}, Total xFP/G: {get_xfp})
                         - {partner_gm}'s Weakest Positional Ranks: {partner_weak_pos}
-                        Cite exact snap %, xFP/G, positional ranks, or projected draft pick slots. Keep it natural and ready to paste into Sleeper chat.
+                        Cite exact Sleeper_Rank, Pos_Rank, snap %, xFP/G, or projected draft pick slots. Keep it natural and ready to paste into Sleeper chat.
                         """
                         try:
                             client = genai.Client(api_key=api_key)
@@ -2206,9 +2400,19 @@ with hub3:
 # ------------------------------------------------------------------------------
 with hub4:
     st.subheader("📈 Expected Fantasy Points (xFP) Regression Lab & Dynasty Portfolio")
-    st.caption(
-        "**FPOE (Fantasy Points Over Expected)** = `Actual PPG - xFP/G`. Negative FPOE with high xFP/G flags an imminent **Buy-Low / Positive Regression Breakout**."
-    )
+    with st.expander("❓ Hub 4 Glossary: Advanced Analytics (FPOE, WOPR, PACR, NGS & Max PF)", expanded=False):
+        st.markdown(
+            """
+            * **`FPOE` (Fantasy Points Over Expected):** `Lookback PPG - xFP/G`.
+              * **Negative FPOE (`-2.0` or lower) with High `xFP/G` (`10+`):** Flags an elite **🟢 BUY LOW / MUST START** player who is earning massive volume/air yards but has been unlucky on touchdowns.
+              * **High Positive FPOE (`+3.5` or higher) with Low `xFP/G`:** Flags an **🟠 SELL HIGH** player surviving on unsustainable long TDs despite low volume.
+            * **`WOPR` (Weighted Opportunity Rating):** Combines target share and air-yards share (`1.5 × Tgt Share + 0.7 × Air Yards Share`). Above `0.55` indicates an alpha WR1/TE1.
+            * **`PACR` (Receiver Conversion Efficiency):** Receiving yards divided by air yards (`Rec Yds / Air Yds`). Above `1.00` indicates strong efficiency.
+            * **`NGS_Sep` (Next Gen Stats Separation):** Average yards of separation between the receiver and nearest defender at the catch point (`2.8+ yds` is above average).
+            * **`Age_Cliff`:** Warns when a player enters historical Dynasty value decline windows (`RB >= 26yo`, `WR >= 28.5yo`, `TE >= 29.5yo`, `QB >= 33.5yo`).
+            * **`Coaching Efficiency`:** `Actual PF / Optimal Max PF`. Shows how effectively each GM sets their weekly starting lineup.
+            """
+        )
 
     if not my_full_roster_df.empty:
         reg_df = my_full_roster_df.copy()
@@ -2222,8 +2426,9 @@ with hub4:
             ),
         )
         reg_cols = [
-            "Player", "Pos", "Pos_Rank", "Team", "Age", "Age_Cliff", "xFP/G", "Recent_PPG",
-            "FPOE", "Regression_Signal", "Snap_%", "Tgt/G", "Car/G", "RZ_Touch/G", "WOPR", "PACR", "NGS_Sep", "Dynasty_Val"
+            "Player", "Pos", "Sleeper_Rank", "Pos_Rank", "Depth_Chart", "Team", "Age", "Age_Cliff",
+            "xFP/G", "Recent_PPG", "FPOE", "Regression_Signal", "Snap_%", "Tgt/G", "Car/G",
+            "RZ_Touch/G", "WOPR", "PACR", "NGS_Sep", "Dynasty_Val"
         ]
         st.dataframe(
             reg_df.sort_values("xFP/G", ascending=False)[reg_cols],
