@@ -1634,7 +1634,7 @@ if not my_full_roster_df.empty:
                 "Notes": r_row["Injury_Notes"] or r_row["Body_Part"] or "-",
             })
 
-# Start/Sit Upgrade Engine (Checks direct position AND cross-position RB/WR/TE FLEX upgrades)
+# Start/Sit Upgrade Engine (Virtual Slot Auto-Optimization for Core vs FLEX)
 if not my_starters_df.empty and not my_bench_df.empty:
     eligible_bench = my_bench_df[
         (~my_bench_df["Is_Bye"]) & (~my_bench_df["Raw_Injury"].isin(["Out", "Doubtful", "IR", "PUP", "NA", "Sus"]))
@@ -1642,7 +1642,7 @@ if not my_starters_df.empty and not my_bench_df.empty:
     metric_key = "Chop_Floor_Score" if active_mode == "CHOP" else "Volume_Score"
     seen_swaps = set()
 
-    # 1. Direct Positional Checks
+    # 1. Direct Positional Checks (Same Position Upgrades Only)
     for pos in ["QB", "RB", "WR", "TE"]:
         st_pos = my_starters_df[my_starters_df["Pos"] == pos]
         bn_pos = eligible_bench[eligible_bench["Pos"] == pos]
@@ -1653,27 +1653,38 @@ if not my_starters_df.empty and not my_bench_df.empty:
                     if swap_k not in seen_swaps:
                         seen_swaps.add(swap_k)
                         volume_swap_alerts.append(
-                            f"⚡ **Start/Sit Upgrade ({pos}):** Start Bench **{b_r['Player']} ({b_r['Pos']})** ({b_r['Matchup']}, {b_r['xFP/G']} xFP/G, {b_r['Sleeper_Rank']}) over **{s_r['Player']} ({s_r['Pos']})** ({s_r['xFP/G']} xFP/G, {s_r['Sleeper_Rank']})."
+                            f"⚡ **Start/Sit Upgrade ({pos}):** Start Bench **{b_r['Player']} ({b_r['Pos']})** ({b_r['Matchup']}, {b_r['xFP/G']} xFP/G) over **{s_r['Player']} ({s_r['Pos']})** ({s_r['xFP/G']} xFP/G)."
                         )
 
-    # 2. Cross-Positional FLEX Checks (RB / WR / TE eligible in FLEX spots)
-    min_pos_req = {"RB": roster_positions.count("RB"), "WR": roster_positions.count("WR"), "TE": roster_positions.count("TE")}
-    st_flex_pool = my_starters_df[my_starters_df["Pos"].isin(["RB", "WR", "TE"])]
-    bn_flex_pool = eligible_bench[eligible_bench["Pos"].isin(["RB", "WR", "TE"])]
-    st_pos_counts = st_flex_pool["Pos"].value_counts().to_dict()
-
-    for _, s_r in st_flex_pool.iterrows():
-        s_pos = s_r["Pos"]
-        # Only swap out a starter for a different position if starter count at s_pos exceeds minimum dedicated slots
-        if st_pos_counts.get(s_pos, 0) > min_pos_req.get(s_pos, 1):
+    # 2. Virtual FLEX Identification for Cross-Positional Upgrades
+    # Identifies league requirements and isolates the mathematically weakest extra starter
+    req_counts = {"RB": roster_positions.count("RB"), "WR": roster_positions.count("WR"), "TE": roster_positions.count("TE")}
+    
+    st_rbs = my_starters_df[my_starters_df["Pos"] == "RB"].sort_values(metric_key, ascending=False)
+    st_wrs = my_starters_df[my_starters_df["Pos"] == "WR"].sort_values(metric_key, ascending=False)
+    st_tes = my_starters_df[my_starters_df["Pos"] == "TE"].sort_values(metric_key, ascending=False)
+    
+    # Protect core starters, flag only the extra players as Flex Candidates
+    flex_candidates = []
+    if len(st_rbs) > req_counts["RB"]: flex_candidates.append(st_rbs.iloc[req_counts["RB"]:])
+    if len(st_wrs) > req_counts["WR"]: flex_candidates.append(st_wrs.iloc[req_counts["WR"]:])
+    if len(st_tes) > req_counts["TE"]: flex_candidates.append(st_tes.iloc[req_counts["TE"]:])
+    
+    if flex_candidates:
+        df_flex_candidates = pd.concat(flex_candidates)
+        bn_flex_pool = eligible_bench[eligible_bench["Pos"].isin(["RB", "WR", "TE"])]
+        
+        # Test bench RBs/WRs/TEs ONLY against the designated weakest flex starters
+        for _, s_f in df_flex_candidates.iterrows():
+            s_pos = s_f["Pos"]
             for _, b_r in bn_flex_pool.iterrows():
                 if b_r["Pos"] != s_pos:
-                    if s_r["Is_Bye"] or (b_r[metric_key] >= s_r[metric_key] + 8.5 and b_r["xFP/G"] >= s_r["xFP/G"] + 1.0):
-                        swap_k = (s_r["PID"], b_r["PID"])
+                    if s_f["Is_Bye"] or (b_r[metric_key] >= s_f[metric_key] + 8.5 and b_r["xFP/G"] >= s_f["xFP/G"] + 1.0):
+                        swap_k = (s_f["PID"], b_r["PID"])
                         if swap_k not in seen_swaps:
                             seen_swaps.add(swap_k)
                             volume_swap_alerts.append(
-                                f"🔄 **FLEX Cross-Position Upgrade ({b_r['Pos']} over {s_pos}):** Start Bench **{b_r['Player']} ({b_r['Pos']})** ({b_r['Matchup']}, {b_r['xFP/G']} xFP/G, {b_r['Sleeper_Rank']}) in your FLEX over **{s_r['Player']} ({s_pos})** ({s_r['xFP/G']} xFP/G)."
+                                f"🔄 **FLEX Cross-Position Upgrade ({b_r['Pos']} over {s_pos}):** Your weakest FLEX starter is **{s_f['Player']} ({s_pos})** ({s_f['xFP/G']} xFP/G). Start Bench **{b_r['Player']} ({b_r['Pos']})** ({b_r['Matchup']}, {b_r['xFP/G']} xFP/G) in their place."
                             )
 
 # ==============================================================================
